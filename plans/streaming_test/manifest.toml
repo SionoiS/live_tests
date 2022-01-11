@@ -1,0 +1,45 @@
+name = "streaming_test"
+
+[defaults]
+builder = "docker:generic"
+runner = "local:docker"
+
+[builders."docker:generic"]
+enabled = true
+
+[builders."docker:go"]
+enabled = false
+
+[builders."exec:go"]
+enabled = false
+
+[runners."local:docker"]
+enabled = true
+
+[runners."local:exec"]
+enabled = false
+
+[runners."cluster:k8s"]
+enabled = false
+
+[[testcases]]
+name= "quickstart"
+instances = { min = 1, max = 5, default = 1 }
+
+[[testcases]]
+name = "smallbrain"
+instances = { min = 1, max = 200, default = 1 }
+
+  [testcases.params]
+  word = { type = "string", default = "never" }
+  num = { type = "int", default = 2 }
+  feature = { type = "bool", default = false }
+
+[[testcases]]
+name = "bigbrain"
+instances = { min = 1, max = 200, default = 1 }
+
+    [testcases.params]
+    word = { type = "string", default = "always" }
+    num = { type = "int", default = 10000000 }
+    feature = { type = "bool", default = false }
