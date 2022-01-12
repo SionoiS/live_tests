@@ -3,46 +3,56 @@ use std::{time::Duration, usize};
 
 use tokio::time::sleep;
 
-use redis::{aio::Connection, AsyncCommands, Client};
+use redis::{aio::MultiplexedConnection, AsyncCommands};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const INTERVAL: Duration = Duration::from_secs(1);
 
-pub struct Barrier {
-    connexion: Connection,
-    key: String,
-    target: usize,
+pub async fn signal_entry(mut connection: MultiplexedConnection, key: &str) -> Result<usize> {
+    let seq = connection.incr(key, 1).await?;
+
+    Ok(seq)
 }
 
-impl Barrier {
-    pub async fn new(
-        client: &Client,
-        key: impl Into<Cow<'static, str>>,
-        target: usize,
-    ) -> Result<Self> {
-        let connexion = client.get_tokio_connection().await?;
-        let key = key.into().into_owned();
+pub async fn barrier(
+    mut connection: MultiplexedConnection,
+    key: impl Into<Cow<'static, str>>,
+    target: usize,
+) -> Result<usize> {
+    let key: String = key.into().into_owned();
 
-        Ok(Self {
-            connexion,
-            key,
-            target,
-        })
-    }
+    loop {
+        let res: Option<usize> = connection.get(&key).await?;
 
-    pub async fn wait(mut self) -> Result<usize> {
-        loop {
-            let res: usize = match self.connexion.get(&self.key).await {
-                Ok(res) => res,
-                Err(e) => return Err(e.into()),
-            };
-
-            if res >= self.target {
+        if let Some(res) = res {
+            if res >= target {
                 return Ok(res);
             }
-
-            sleep(INTERVAL).await;
         }
+
+        sleep(INTERVAL).await;
+    }
+}
+
+pub async fn signal_and_wait(
+    mut connection: MultiplexedConnection,
+    key: impl Into<Cow<'static, str>>,
+    target: usize,
+) -> Result<usize> {
+    let key = key.into().into_owned();
+
+    connection.incr(&key, 1).await?;
+
+    loop {
+        let res: Option<usize> = connection.get(&key).await?;
+
+        if let Some(res) = res {
+            if res >= target {
+                return Ok(res);
+            }
+        }
+
+        sleep(INTERVAL).await;
     }
 }
