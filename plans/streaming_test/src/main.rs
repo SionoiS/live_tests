@@ -1,7 +1,7 @@
 mod synchronization;
 mod utils;
 
-use std::{net::IpAddr, path::PathBuf};
+use std::path::PathBuf;
 
 use structopt::StructOpt;
 
@@ -11,6 +11,14 @@ use utils::*;
 use pnet::ipnetwork::IpNetwork;
 
 use futures_util::stream::StreamExt;
+
+use libp2p::{
+    identity,
+    multiaddr::Protocol,
+    ping::{Ping, PingConfig},
+    swarm::SwarmEvent,
+    Multiaddr, PeerId, Swarm,
+};
 
 #[derive(StructOpt)]
 #[allow(dead_code)]
@@ -63,39 +71,52 @@ struct Arguments {
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args = Arguments::from_args();
 
+    let own_ip = get_data_network_ip(args.test_sidecar, args.test_subnet);
+
     let sync_client = SyncClient::new(&args.redis_host).await?;
 
-    sync_client
-        .wait_for_network_initialized(
-            args.test_run,
-            args.test_plan,
-            args.test_case,
-            args.test_group_id,
-            args.test_instance_count,
-        )
-        .await?;
+    /* sync_client
+    .wait_for_network_initialized(
+        args.test_sidecar,
+        args.test_run,
+        args.test_plan,
+        args.test_case,
+        args.test_group_id,
+        args.test_instance_count,
+    )
+    .await?; */
 
-    let ip = get_data_network_ip(args.test_sidecar, args.test_subnet);
+    let local_key = identity::Keypair::generate_ed25519();
+    let local_peer_id = PeerId::from(local_key.public());
+
+    let transport = libp2p::development_transport(local_key).await?;
+
+    let behaviour = Ping::new(PingConfig::new().with_keep_alive(true));
+
+    let mut swarm = Swarm::new(transport, behaviour, local_peer_id);
+
+    let mut own_multi_addr: Multiaddr = own_ip.into();
+    own_multi_addr.push(Protocol::Tcp(8080));
+    swarm.listen_on(own_multi_addr.clone())?;
 
     let mut stream = sync_client.subscribe("addresses").await?;
 
-    let seq = sync_client.signal_entry("init").await?;
+    sync_client
+        .signal_and_wait("init", args.test_instance_count)
+        .await?;
+    //Barrier waiting for every container to subscribe.
 
-    println!("I'm intance #{} and my IP address is {:?}", seq, ip);
+    sync_client
+        .publish("addresses", own_multi_addr.to_string())
+        .await?;
 
-    let mut barrier = sync_client.barrier("init", args.test_instance_count);
-    barrier.down().await?; //Barrier waiting for every container to subscribe.
-
-    sync_client.publish("addresses", ip.to_string()).await?;
-
-    let mut ips: Vec<IpAddr> = Vec::with_capacity(args.test_instance_count);
+    let mut addresses: Vec<Multiaddr> = Vec::with_capacity(args.test_instance_count);
 
     sync_client.signal_entry("ready").await?;
-    let mut barrier = sync_client.barrier("ready", args.test_instance_count);
 
     loop {
         tokio::select! {
@@ -104,15 +125,37 @@ async fn main() -> Result<()> {
             Some(msg) = stream.next() => {
                 let payload: String = msg.get_payload().unwrap();
 
-                let ip = payload.parse().unwrap();
+                let multi_addr = payload.parse().unwrap();
 
-                ips.push(ip);
+                addresses.push(multi_addr);
             },
-            _ = barrier.down() => break,
+            _ = sync_client.barrier("ready", args.test_instance_count) => break,
         }
     }
 
-    println!("{} Received IPs {:?}", ips.len(), ips);
+    for multi_addr in addresses {
+        if multi_addr == own_multi_addr {
+            continue;
+        }
+
+        println!("Dialing {:?}", multi_addr);
+
+        swarm.dial(multi_addr)?;
+    }
+
+    let sleep = tokio::time::sleep(std::time::Duration::from_secs(60));
+    tokio::pin!(sleep);
+
+    loop {
+        tokio::select! {
+            Some(msg) = swarm.next() => match msg {
+                SwarmEvent::NewListenAddr { address, .. } => println!("Listening on {:?}", address),
+                SwarmEvent::Behaviour(event) => println!("{:?}", event),
+                _ => {}
+            },
+            _ = &mut sleep => break,
+        }
+    }
 
     Ok(())
 }

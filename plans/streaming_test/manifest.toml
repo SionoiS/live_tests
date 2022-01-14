@@ -24,7 +24,7 @@ enabled = false
 
 [[testcases]]
 name= "quickstart"
-instances = { min = 10, max = 100, default = 50 }
+instances = { min = 1, max = 100, default = 50 }
 
 [[testcases]]
 name = "smallbrain"

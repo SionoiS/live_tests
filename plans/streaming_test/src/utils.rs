@@ -16,7 +16,7 @@ pub fn get_data_network_ip(sidecar: bool, subnet: IpNetwork) -> IpAddr {
     for interface in all_interfaces {
         //println!("Interface => {:?}", interface);
 
-        if !interface.is_up() || interface.is_loopback() {
+        if !interface.is_up() || interface.is_loopback() || interface.ips.is_empty() {
             continue;
         }
 

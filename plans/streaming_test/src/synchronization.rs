@@ -23,21 +23,24 @@ impl SyncClient {
         Ok(Self { connection, client })
     }
 
-    pub async fn wait_for_network_initialized(
+    /* pub async fn wait_for_network_initialized(
         &self,
+        test_sidecar: bool,
         test_run: String,
         test_plan: String,
         test_case: String,
         test_group_id: String,
         test_instance_count: usize,
     ) -> Result<()> {
+        //TODO fix this!
+
         let event_key = format!(
             "run:{}:plan:{}:case:{}:run_events",
             test_run, test_plan, test_case
         );
 
         let event = format!(
-            "{{\"stage_start_event\": {{\"name\": \"network-initialized\", \"group\": \"{}\"}}",
+            "{{\"event\": {{\"stage_start_event\": {{\"name\": \"network-initialized\", \"group\": \"{}\"}}}}",
             test_group_id
         );
 
@@ -45,15 +48,19 @@ impl SyncClient {
 
         self.publish(&event_key, event).await?;
 
-        let state_key = format!(
-            "run:{}:plan:{}:case:{}:states:{}",
-            test_run, test_plan, test_case, "network-initialized"
-        );
+        if test_sidecar {
+            let state_key = format!(
+                "{{\"run_id\": \"{}\", \"plan\": \"{}\", \"case\": \"{}\", \"states\": \"network-initialized\"}}",
+                test_run, test_plan, test_case
+            );
 
-        println!("Publish\nKey => {}", state_key);
+            println!("{}", state_key);
 
-        let mut barrier = self.barrier(state_key, test_instance_count);
-        barrier.down().await?; // Network was initialized
+            let mut barrier = self.barrier(state_key, test_instance_count);
+            barrier.down().await?;
+
+            println!("Network Initialized!");
+        }
 
         let event_key = format!(
             "run:{}:plan:{}:case:{}:run_events",
@@ -61,7 +68,7 @@ impl SyncClient {
         );
 
         let event = format!(
-            "{{\"stage_end_event\": {{\"name\": \"network-initialized\", \"group\": \"{}\"}}",
+            "{{\"event\": {{\"stage_end_event\": {{\"name\": \"network-initialized\", \"group\": \"{}\"}}}}",
             test_group_id
         );
 
@@ -70,13 +77,23 @@ impl SyncClient {
         self.publish(&event_key, event).await?;
 
         Ok(())
-    }
+    } */
 
-    pub fn barrier(&self, key: impl Into<Cow<'static, str>>, target: usize) -> Barrier {
-        let connection = self.connection.clone();
+    pub async fn barrier(&self, key: impl Into<Cow<'static, str>>, target: usize) -> Result<usize> {
+        let mut connection = self.connection.clone();
         let key: String = key.into().into_owned();
 
-        Barrier::new(connection, key, target)
+        loop {
+            let res: Option<usize> = connection.get(&key).await?;
+
+            if let Some(res) = res {
+                if res >= target {
+                    return Ok(res);
+                }
+            }
+
+            sleep(INTERVAL).await;
+        }
     }
 
     pub async fn publish(
@@ -97,6 +114,35 @@ impl SyncClient {
         Ok(seq)
     }
 
+    pub async fn signal_and_wait(
+        &self,
+        key: impl Into<Cow<'static, str>>,
+        target: usize,
+    ) -> Result<usize> {
+        let mut connection = self.connection.clone();
+        let key: String = key.into().into_owned();
+
+        let res: Option<usize> = connection.incr(&key, 1).await?;
+
+        if let Some(res) = res {
+            if res >= target {
+                return Ok(res);
+            }
+        }
+
+        loop {
+            let res: Option<usize> = connection.get(&key).await?;
+
+            if let Some(res) = res {
+                if res >= target {
+                    return Ok(res);
+                }
+            }
+
+            sleep(INTERVAL).await;
+        }
+    }
+
     pub async fn subscribe(&self, topic: &str) -> Result<impl Stream<Item = Msg>> {
         let connection = self.client.get_tokio_connection().await?;
         let mut pubsub = connection.into_pubsub();
@@ -104,35 +150,5 @@ impl SyncClient {
         pubsub.subscribe(topic).await?;
 
         Ok(pubsub.into_on_message())
-    }
-}
-
-pub struct Barrier {
-    connection: MultiplexedConnection,
-    key: String,
-    target: usize,
-}
-
-impl Barrier {
-    fn new(connection: MultiplexedConnection, key: String, target: usize) -> Self {
-        Self {
-            connection,
-            key,
-            target,
-        }
-    }
-
-    pub async fn down(&mut self) -> Result<()> {
-        loop {
-            let res: Option<usize> = self.connection.get(&self.key).await?;
-
-            if let Some(res) = res {
-                if res >= self.target {
-                    return Ok(());
-                }
-            }
-
-            sleep(INTERVAL).await;
-        }
     }
 }
