@@ -28,5 +28,6 @@ FROM debian:buster-slim
 #COPY --from=builder /usr/local/cargo/bin/live_test .
 COPY --from=builder /live_test/target/release/live_test .
 
-EXPOSE 8080
+EXPOSE 4001/udp
+EXPOSE 4001/tcp
 ENTRYPOINT [ "./live_test"]

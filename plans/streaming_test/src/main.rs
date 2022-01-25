@@ -1,24 +1,22 @@
+mod composition;
+mod ipfs;
 mod synchronization;
 mod utils;
 
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
+use ipfs::IpfsClient;
 use structopt::StructOpt;
 
 use synchronization::*;
+use tokio::time;
 use utils::*;
 
 use pnet::ipnetwork::IpNetwork;
 
 use futures_util::stream::StreamExt;
 
-use libp2p::{
-    identity,
-    multiaddr::Protocol,
-    ping::{Ping, PingConfig},
-    swarm::SwarmEvent,
-    Multiaddr, PeerId, Swarm,
-};
+use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 
 #[derive(StructOpt)]
 #[allow(dead_code)]
@@ -71,91 +69,153 @@ struct Arguments {
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+const REDIS_TOPIC: &str = "addr_ex";
+const INIT_STATE: &str = "init";
+const NET_STATE: &str = "net";
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args = Arguments::from_args();
 
-    let own_ip = get_data_network_ip(args.test_sidecar, args.test_subnet);
-
     let sync_client = SyncClient::new(&args.redis_host).await?;
 
-    /* sync_client
-    .wait_for_network_initialized(
-        args.test_sidecar,
-        args.test_run,
-        args.test_plan,
-        args.test_case,
-        args.test_group_id,
-        args.test_instance_count,
-    )
-    .await?; */
+    let local_ip = data_network_ip(args.test_sidecar, args.test_subnet);
 
-    let local_key = identity::Keypair::generate_ed25519();
-    let local_peer_id = PeerId::from(local_key.public());
+    let mut local_multi_addr: Multiaddr = local_ip.into();
+    local_multi_addr.push(Protocol::Tcp(4001));
 
-    let transport = libp2p::development_transport(local_key).await?;
+    let (ipfs, handle, local_peer_id) = utils::compose_network();
 
-    let behaviour = Ping::new(PingConfig::new().with_keep_alive(true));
+    if let Err(e) = ipfs.listen_on(local_multi_addr.clone()).await {
+        eprintln!("{:?}", e);
+    }
 
-    let mut swarm = Swarm::new(transport, behaviour, local_peer_id);
+    let sim_id = sync_client.signal_entry(INIT_STATE).await?;
 
-    let mut own_multi_addr: Multiaddr = own_ip.into();
-    own_multi_addr.push(Protocol::Tcp(8080));
-    swarm.listen_on(own_multi_addr.clone())?;
+    let mut stream = sync_client.subscribe(REDIS_TOPIC).await?;
 
-    let mut stream = sync_client.subscribe("addresses").await?;
-
+    // Barrier waiting for every container to initialize and subscribe.
     sync_client
-        .signal_and_wait("init", args.test_instance_count)
-        .await?;
-    //Barrier waiting for every container to subscribe.
-
-    sync_client
-        .publish("addresses", own_multi_addr.to_string())
+        .barrier(INIT_STATE, args.test_instance_count)
         .await?;
 
+    let msg = format!(
+        "{} {}",
+        local_peer_id.to_base58(),
+        local_multi_addr.to_string()
+    );
+
+    // Send PeerId & MultiAddress to all other nodes.
+    sync_client.publish(REDIS_TOPIC, msg).await?;
+
+    let mut peer_ids: Vec<PeerId> = Vec::with_capacity(args.test_instance_count);
     let mut addresses: Vec<Multiaddr> = Vec::with_capacity(args.test_instance_count);
 
-    sync_client.signal_entry("ready").await?;
+    sync_client.signal_entry(NET_STATE).await?;
 
     loop {
         tokio::select! {
-            biased;//pool future in order. We want all the msg then check if barrier is down.
-
+            biased;
+            // Pool futures in order. We want all the msg then check if barrier is down.
             Some(msg) = stream.next() => {
                 let payload: String = msg.get_payload().unwrap();
 
-                let multi_addr = payload.parse().unwrap();
+                let parts: Vec<&str> = payload.split(' ').collect();
 
+                let peer_id: PeerId = parts[0].parse().unwrap();
+                let multi_addr: Multiaddr = parts[1].parse().unwrap();
+
+                peer_ids.push(peer_id);
                 addresses.push(multi_addr);
             },
-            _ = sync_client.barrier("ready", args.test_instance_count) => break,
+            _ = sync_client.barrier(NET_STATE, args.test_instance_count) => break,
         }
     }
 
-    for multi_addr in addresses {
-        if multi_addr == own_multi_addr {
+    // Add all other nodes to DHT.
+    for (peer, addr) in peer_ids.into_iter().zip(addresses.into_iter()) {
+        if peer == local_peer_id {
             continue;
         }
 
-        println!("Dialing {:?}", multi_addr);
-
-        swarm.dial(multi_addr)?;
+        ipfs.dht_add_addr(peer, addr).await;
     }
 
-    let sleep = tokio::time::sleep(std::time::Duration::from_secs(60));
+    // Wait for all node to add other nodes.
+    if let Err(e) = sync_client
+        .signal_and_wait("addrs_added", args.test_instance_count)
+        .await
+    {
+        eprintln!("{}", e);
+    }
+
+    if let Err(e) = ipfs.dht_bootstrap().await {
+        eprintln!("{:?}", e);
+    }
+
+    if let Err(e) = sync_client
+        .signal_and_wait("bootstrapped", args.test_instance_count)
+        .await
+    {
+        eprintln!("{}", e);
+    }
+
+    if sim_id == 1 {
+        publisher(&ipfs).await;
+    } else {
+        subscribers(&ipfs).await;
+    }
+
+    if let Err(e) = sync_client
+        .signal_and_wait("stopping", args.test_instance_count)
+        .await
+    {
+        eprintln!("{}", e);
+    }
+
+    handle.abort();
+
+    Ok(())
+}
+
+async fn subscribers(ipfs: &IpfsClient) {
+    let sleep = time::sleep(Duration::from_secs(120));
     tokio::pin!(sleep);
+
+    let mut stream = match ipfs.subscribe("live").await {
+        Ok(stream) => stream,
+        Err(e) => {
+            eprintln!("{:?}", e);
+            return;
+        }
+    };
 
     loop {
         tokio::select! {
-            Some(msg) = swarm.next() => match msg {
-                SwarmEvent::NewListenAddr { address, .. } => println!("Listening on {:?}", address),
-                SwarmEvent::Behaviour(event) => println!("{:?}", event),
-                _ => {}
+            Some(msg) = stream.next() => {
+                println!("{:?}", msg);
             },
             _ = &mut sleep => break,
         }
     }
+}
 
-    Ok(())
+async fn publisher(ipfs: &IpfsClient) {
+    let sleep = time::sleep(Duration::from_secs(120));
+    tokio::pin!(sleep);
+
+    loop {
+        tokio::select! {
+            _ = async {
+                loop {
+                    time::sleep(Duration::from_secs(2)).await;
+
+                    if let Err(e) = ipfs.publish("live", b"Hello!".to_vec()).await {
+                        eprintln!("{:?}", e);
+                    }
+                }
+            } => {},
+            _ = &mut sleep => break,
+        }
+    }
 }
