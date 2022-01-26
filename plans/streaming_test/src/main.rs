@@ -1,20 +1,23 @@
-mod composition;
 mod ipfs;
 mod synchronization;
 mod utils;
 
 use std::{path::PathBuf, time::Duration};
 
-use ipfs::IpfsClient;
+use cid::Cid;
+use rand::SeedableRng;
+use rand_xoshiro::Xoshiro256StarStar;
 use structopt::StructOpt;
 
+use ipfs::*;
 use synchronization::*;
-use tokio::time;
 use utils::*;
 
 use pnet::ipnetwork::IpNetwork;
 
 use futures_util::stream::StreamExt;
+
+use tokio::time;
 
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 
@@ -73,6 +76,10 @@ const REDIS_TOPIC: &str = "addr_ex";
 const INIT_STATE: &str = "init";
 const NET_STATE: &str = "net";
 
+const SIM_TIME: u64 = 60;
+
+const GOSSIPSUB_TOPIC: &str = "live";
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args = Arguments::from_args();
@@ -84,7 +91,7 @@ async fn main() -> Result<()> {
     let mut local_multi_addr: Multiaddr = local_ip.into();
     local_multi_addr.push(Protocol::Tcp(4001));
 
-    let (ipfs, handle, local_peer_id) = utils::compose_network();
+    let (ipfs, handle, local_peer_id) = ipfs::compose_network();
 
     if let Err(e) = ipfs.listen_on(local_multi_addr.clone()).await {
         eprintln!("{:?}", e);
@@ -153,6 +160,7 @@ async fn main() -> Result<()> {
         eprintln!("{:?}", e);
     }
 
+    // Wait for all node to bootstrap.
     if let Err(e) = sync_client
         .signal_and_wait("bootstrapped", args.test_instance_count)
         .await
@@ -166,6 +174,7 @@ async fn main() -> Result<()> {
         subscribers(&ipfs).await;
     }
 
+    // Wait for all node to stop.
     if let Err(e) = sync_client
         .signal_and_wait("stopping", args.test_instance_count)
         .await
@@ -179,10 +188,10 @@ async fn main() -> Result<()> {
 }
 
 async fn subscribers(ipfs: &IpfsClient) {
-    let sleep = time::sleep(Duration::from_secs(120));
+    let sleep = time::sleep(Duration::from_secs(SIM_TIME));
     tokio::pin!(sleep);
 
-    let mut stream = match ipfs.subscribe("live").await {
+    let mut stream = match ipfs.subscribe(GOSSIPSUB_TOPIC).await {
         Ok(stream) => stream,
         Err(e) => {
             eprintln!("{:?}", e);
@@ -193,7 +202,11 @@ async fn subscribers(ipfs: &IpfsClient) {
     loop {
         tokio::select! {
             Some(msg) = stream.next() => {
-                println!("{:?}", msg);
+                let cid = Cid::try_from(msg.data).unwrap();
+
+                let block = ipfs.get_block(cid).await;
+
+                println!("Received Block -> {}", block.cid());
             },
             _ = &mut sleep => break,
         }
@@ -201,16 +214,24 @@ async fn subscribers(ipfs: &IpfsClient) {
 }
 
 async fn publisher(ipfs: &IpfsClient) {
-    let sleep = time::sleep(Duration::from_secs(120));
+    let mut rng = Xoshiro256StarStar::seed_from_u64(5634653465365u64);
+
+    let sleep = time::sleep(Duration::from_secs(SIM_TIME));
     tokio::pin!(sleep);
 
     loop {
         tokio::select! {
             _ = async {
                 loop {
+                    let block = get_random_block(&mut rng);
+
+                    let cid_bytes = block.cid().to_bytes();
+
                     time::sleep(Duration::from_secs(2)).await;
 
-                    if let Err(e) = ipfs.publish("live", b"Hello!".to_vec()).await {
+                    ipfs.add_block(block).await;
+
+                    if let Err(e) = ipfs.publish(GOSSIPSUB_TOPIC, cid_bytes).await {
                         eprintln!("{:?}", e);
                     }
                 }
