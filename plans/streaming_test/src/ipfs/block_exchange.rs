@@ -14,7 +14,7 @@ pub struct BlockExchange {
     cid_indices: Vec<usize>,  // cid idx mapped to peer idx
 
     cids: Vec<Cid>, // First Cids with data then starting at index == data_store.len(), Cids without data
-    data_store: Vec<Box<[u8]>>,
+    datums: Vec<Box<[u8]>>,
 }
 
 impl BlockExchange {
@@ -108,7 +108,7 @@ impl BlockExchange {
     }
 
     pub fn get_block(&self, cid: &Cid) -> Option<Block> {
-        for (id, data) in self.cids.iter().zip(self.data_store.iter()) {
+        for (id, data) in self.cids.iter().zip(self.datums.iter()) {
             if cid != id {
                 continue;
             }
@@ -131,7 +131,7 @@ impl BlockExchange {
             }
 
             // Case: cid & data are present
-            if i < self.data_store.len() {
+            if i < self.datums.len() {
                 return false;
             }
 
@@ -156,7 +156,7 @@ impl BlockExchange {
             self.cids.push(cid);
         }
 
-        self.data_store.push(data);
+        self.datums.push(data);
 
         true
     }

@@ -37,8 +37,13 @@ pub fn data_network_ip(sidecar: bool, subnet: IpNetwork) -> IpAddr {
     IpAddr::V4(Ipv4Addr::LOCALHOST)
 }
 
+/// Randomly generate a block.
 pub fn get_random_block(rng: &mut impl RngCore) -> Block {
-    let mut data = [0u8; 1024];
+    // 524288 bytes is unofficial max length.
+
+    // 262144 bytes is standard chunker length.
+
+    let mut data = [0u8; 262144];
     rng.fill_bytes(&mut data);
 
     let cid = Cid::new_v1(Codec::Raw, Sha2_256::digest(&data));

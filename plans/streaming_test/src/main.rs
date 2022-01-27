@@ -1,29 +1,23 @@
 mod ipfs;
+mod nodes;
 mod synchronization;
 mod utils;
 
-use std::{path::PathBuf, time::Duration};
-
-use cid::Cid;
-use rand::SeedableRng;
-use rand_xoshiro::Xoshiro256StarStar;
-use structopt::StructOpt;
-
-use ipfs::*;
+use nodes::{neutral::*, streamer::*, viewer::*};
 use synchronization::*;
 use utils::*;
 
+use std::path::PathBuf;
+
+use structopt::StructOpt;
+
 use pnet::ipnetwork::IpNetwork;
 
-use futures_util::stream::StreamExt;
-
-use tokio::time;
-
-use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
+use libp2p::{multiaddr::Protocol, Multiaddr};
 
 #[derive(StructOpt)]
 #[allow(dead_code)]
-struct Arguments {
+pub struct Arguments {
     //PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     #[structopt(env)]
     hostname: Option<String>, // HOSTNAME: e6f4cc8fc147
@@ -70,15 +64,18 @@ struct Arguments {
                         // HOME: /
 }
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-const REDIS_TOPIC: &str = "addr_ex";
-const INIT_STATE: &str = "init";
-const NET_STATE: &str = "net";
+pub const REDIS_TOPIC: &str = "addr_ex";
 
-const SIM_TIME: u64 = 60;
+pub const INIT_STATE: &str = "init";
+pub const NET_STATE: &str = "net";
+pub const BOOTSTRAP_STATE: &str = "bootstrapped";
+pub const STOP_STATE: &str = "stop";
 
-const GOSSIPSUB_TOPIC: &str = "live";
+pub const SIM_TIME: u64 = 60;
+
+pub const GOSSIPSUB_TOPIC: &str = "live";
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
@@ -86,157 +83,51 @@ async fn main() -> Result<()> {
 
     let sync_client = SyncClient::new(&args.redis_host).await?;
 
-    let local_ip = data_network_ip(args.test_sidecar, args.test_subnet);
+    let local_multi_addr = {
+        let local_ip = data_network_ip(args.test_sidecar, args.test_subnet);
 
-    let mut local_multi_addr: Multiaddr = local_ip.into();
-    local_multi_addr.push(Protocol::Tcp(4001));
+        let mut addr: Multiaddr = local_ip.into();
+
+        addr.push(Protocol::Tcp(4001));
+
+        addr
+    };
 
     let (ipfs, handle, local_peer_id) = ipfs::compose_network();
 
-    if let Err(e) = ipfs.listen_on(local_multi_addr.clone()).await {
-        eprintln!("{:?}", e);
-    }
+    ipfs.listen_on(local_multi_addr.clone()).await?;
 
     let sim_id = sync_client.signal_entry(INIT_STATE).await?;
 
-    let mut stream = sync_client.subscribe(REDIS_TOPIC).await?;
-
-    // Barrier waiting for every container to initialize and subscribe.
-    sync_client
-        .barrier(INIT_STATE, args.test_instance_count)
-        .await?;
-
-    let msg = format!(
-        "{} {}",
-        local_peer_id.to_base58(),
-        local_multi_addr.to_string()
-    );
-
-    // Send PeerId & MultiAddress to all other nodes.
-    sync_client.publish(REDIS_TOPIC, msg).await?;
-
-    let mut peer_ids: Vec<PeerId> = Vec::with_capacity(args.test_instance_count);
-    let mut addresses: Vec<Multiaddr> = Vec::with_capacity(args.test_instance_count);
-
-    sync_client.signal_entry(NET_STATE).await?;
-
-    loop {
-        tokio::select! {
-            biased;
-            // Pool futures in order. We want all the msg then check if barrier is down.
-            Some(msg) = stream.next() => {
-                let payload: String = msg.get_payload().unwrap();
-
-                let parts: Vec<&str> = payload.split(' ').collect();
-
-                let peer_id: PeerId = parts[0].parse().unwrap();
-                let multi_addr: Multiaddr = parts[1].parse().unwrap();
-
-                peer_ids.push(peer_id);
-                addresses.push(multi_addr);
-            },
-            _ = sync_client.barrier(NET_STATE, args.test_instance_count) => break,
-        }
-    }
-
-    // Add all other nodes to DHT.
-    for (peer, addr) in peer_ids.into_iter().zip(addresses.into_iter()) {
-        if peer == local_peer_id {
-            continue;
-        }
-
-        ipfs.dht_add_addr(peer, addr).await;
-    }
-
-    // Wait for all node to add other nodes.
-    if let Err(e) = sync_client
-        .signal_and_wait("addrs_added", args.test_instance_count)
-        .await
-    {
-        eprintln!("{}", e);
-    }
-
-    if let Err(e) = ipfs.dht_bootstrap().await {
-        eprintln!("{:?}", e);
-    }
-
-    // Wait for all node to bootstrap.
-    if let Err(e) = sync_client
-        .signal_and_wait("bootstrapped", args.test_instance_count)
-        .await
-    {
-        eprintln!("{}", e);
-    }
-
     if sim_id == 1 {
-        publisher(&ipfs).await;
-    } else {
-        subscribers(&ipfs).await;
-    }
-
-    // Wait for all node to stop.
-    if let Err(e) = sync_client
-        .signal_and_wait("stopping", args.test_instance_count)
+        streamer(
+            ipfs,
+            sync_client,
+            handle,
+            args,
+            local_peer_id,
+            local_multi_addr,
+        )
         .await
-    {
-        eprintln!("{}", e);
-    }
-
-    handle.abort();
-
-    Ok(())
-}
-
-async fn subscribers(ipfs: &IpfsClient) {
-    let sleep = time::sleep(Duration::from_secs(SIM_TIME));
-    tokio::pin!(sleep);
-
-    let mut stream = match ipfs.subscribe(GOSSIPSUB_TOPIC).await {
-        Ok(stream) => stream,
-        Err(e) => {
-            eprintln!("{:?}", e);
-            return;
-        }
-    };
-
-    loop {
-        tokio::select! {
-            Some(msg) = stream.next() => {
-                let cid = Cid::try_from(msg.data).unwrap();
-
-                let block = ipfs.get_block(cid).await;
-
-                println!("Received Block -> {}", block.cid());
-            },
-            _ = &mut sleep => break,
-        }
-    }
-}
-
-async fn publisher(ipfs: &IpfsClient) {
-    let mut rng = Xoshiro256StarStar::seed_from_u64(5634653465365u64);
-
-    let sleep = time::sleep(Duration::from_secs(SIM_TIME));
-    tokio::pin!(sleep);
-
-    loop {
-        tokio::select! {
-            _ = async {
-                loop {
-                    let block = get_random_block(&mut rng);
-
-                    let cid_bytes = block.cid().to_bytes();
-
-                    time::sleep(Duration::from_secs(2)).await;
-
-                    ipfs.add_block(block).await;
-
-                    if let Err(e) = ipfs.publish(GOSSIPSUB_TOPIC, cid_bytes).await {
-                        eprintln!("{:?}", e);
-                    }
-                }
-            } => {},
-            _ = &mut sleep => break,
-        }
+    } else if sim_id <= args.test_instance_count / 4 {
+        neutral(
+            ipfs,
+            sync_client,
+            handle,
+            args,
+            local_peer_id,
+            local_multi_addr,
+        )
+        .await
+    } else {
+        viewer(
+            ipfs,
+            sync_client,
+            handle,
+            args,
+            local_peer_id,
+            local_multi_addr,
+        )
+        .await
     }
 }
