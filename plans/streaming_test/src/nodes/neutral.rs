@@ -1,7 +1,4 @@
-use crate::{
-    ipfs::*, synchronization::*, Arguments, Result, BOOTSTRAP_STATE, INIT_STATE, NET_STATE,
-    REDIS_TOPIC, STOP_STATE,
-};
+use crate::{ipfs::*, Arguments, Result, INIT_STATE, REDIS_TOPIC, STOP_STATE};
 
 use futures_util::stream::StreamExt;
 
@@ -9,51 +6,46 @@ use tokio::task::JoinHandle;
 
 use libp2p::{Multiaddr, PeerId};
 
+use testground::client::Client;
+
 pub async fn neutral(
+    sim_id: u64,
     ipfs: IpfsClient,
-    sync_client: SyncClient,
+    sync_client: Client,
     handle: JoinHandle<()>,
     args: Arguments,
     local_peer_id: PeerId,
     local_multi_addr: Multiaddr,
 ) -> Result<()> {
-    let mut stream = sync_client.subscribe(REDIS_TOPIC).await?;
+    println!(
+        "Neutral Sim ID: {} Peer: {} Addr: {}",
+        sim_id, local_peer_id, local_multi_addr
+    );
+
+    let mut stream = sync_client.subscribe(REDIS_TOPIC).await;
 
     // Barrier waiting for every container to initialize and subscribe.
     sync_client
-        .barrier(INIT_STATE, args.test_instance_count)
+        .wait_for_barrier(INIT_STATE, args.test_instance_count)
         .await?;
 
-    let mut peer_ids: Vec<PeerId> = Vec::with_capacity(args.test_instance_count);
-    let mut addresses: Vec<Multiaddr> = Vec::with_capacity(args.test_instance_count);
+    //Wait for the streamer node peer_id & multi_addr
+    if let Some(msg) = stream.next().await {
+        let payload = match msg {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Redis PubSub Error: {:?}", e);
+                return Ok(());
+            }
+        };
 
-    loop {
-        tokio::select! {
-            biased;
-            // Pool futures in order. We want all the msg then check if barrier is down.
-            Some(msg) = stream.next() => {
-                let payload: String = msg.get_payload().unwrap();
+        let parts: Vec<&str> = payload.split(' ').collect();
 
-                let parts: Vec<&str> = payload.split(' ').collect();
-
-                let peer_id: PeerId = parts[0].parse().unwrap();
-                let multi_addr: Multiaddr = parts[1].parse().unwrap();
-
-                peer_ids.push(peer_id);
-                addresses.push(multi_addr);
-            },
-            _ = sync_client.barrier(NET_STATE, 1) => break,
-        }
-    }
-
-    // Add all other nodes to DHT.
-    for (peer, addr) in peer_ids.into_iter().zip(addresses.into_iter()) {
-        if peer == local_peer_id {
-            continue;
-        }
+        let peer: PeerId = parts[0].parse().unwrap();
+        let addr: Multiaddr = parts[1].parse().unwrap();
 
         println!(
-            "Neutral node {} connecting to: {}, {}",
+            "Neutral node {} connecting to {}, {}",
             local_peer_id, peer, addr
         );
 
@@ -72,8 +64,6 @@ pub async fn neutral(
 
     // Send PeerId & MultiAddress to all other nodes.
     sync_client.publish(REDIS_TOPIC, msg).await?;
-
-    sync_client.signal_entry(BOOTSTRAP_STATE).await?;
 
     // Wait for all node to stop.
     sync_client

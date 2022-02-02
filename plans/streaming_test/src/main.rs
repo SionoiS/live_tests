@@ -1,10 +1,8 @@
 mod ipfs;
 mod nodes;
-mod synchronization;
 mod utils;
 
 use nodes::{neutral::*, streamer::*, viewer::*};
-use synchronization::*;
 use utils::*;
 
 use std::path::PathBuf;
@@ -14,6 +12,8 @@ use structopt::StructOpt;
 use pnet::ipnetwork::IpNetwork;
 
 use libp2p::{multiaddr::Protocol, Multiaddr};
+
+use testground::client::Client;
 
 #[derive(StructOpt)]
 #[allow(dead_code)]
@@ -28,7 +28,7 @@ pub struct Arguments {
     #[structopt(env)]
     test_branch: Option<String>, // TEST_BRANCH:
     #[structopt(env)]
-    test_instance_count: usize, // TEST_INSTANCE_COUNT: 1
+    test_instance_count: u64, // TEST_INSTANCE_COUNT: 1
     #[structopt(env)]
     test_instance_role: Option<String>, // TEST_INSTANCE_ROLE:
     #[structopt(env)]
@@ -42,7 +42,7 @@ pub struct Arguments {
     #[structopt(env)]
     test_group_id: String, // TEST_GROUP_ID: single
     #[structopt(env)]
-    test_instance_params: Option<String>, // TEST_INSTANCE_PARAMS:
+    test_instance_params: Option<String>, // TEST_INSTANCE_PARAMS: feature=false|neutral_nodes=10|num=2|word=never
     #[structopt(env)]
     test_repo: Option<String>, //TEST_REPO:
     #[structopt(env)]
@@ -79,9 +79,9 @@ pub const GOSSIPSUB_TOPIC: &str = "live";
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    let args = Arguments::from_args();
+    let sync_client: Client = Client::new().await.expect("Creating sync service");
 
-    let sync_client = SyncClient::new(&args.redis_host).await?;
+    let args = Arguments::from_args();
 
     let local_multi_addr = {
         let local_ip = data_network_ip(args.test_sidecar, args.test_subnet);
@@ -95,12 +95,23 @@ async fn main() -> Result<()> {
 
     let (ipfs, handle, local_peer_id) = ipfs::compose_network();
 
-    ipfs.listen_on(local_multi_addr.clone()).await?;
+    ipfs.listen_on(local_multi_addr.clone())
+        .await
+        .expect("Listening on local address");
 
-    let sim_id = sync_client.signal_entry(INIT_STATE).await?;
+    sync_client
+        .wait_network_initialized()
+        .await
+        .expect("Network initialization");
+
+    let sim_id = sync_client
+        .signal(INIT_STATE)
+        .await
+        .expect("Waiting for signal");
 
     if sim_id == 1 {
         streamer(
+            sim_id,
             ipfs,
             sync_client,
             handle,
@@ -111,6 +122,7 @@ async fn main() -> Result<()> {
         .await
     } else if sim_id <= args.test_instance_count / 4 {
         neutral(
+            sim_id,
             ipfs,
             sync_client,
             handle,
@@ -121,6 +133,7 @@ async fn main() -> Result<()> {
         .await
     } else {
         viewer(
+            sim_id,
             ipfs,
             sync_client,
             handle,

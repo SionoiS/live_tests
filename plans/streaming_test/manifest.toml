@@ -24,13 +24,7 @@ enabled = false
 
 [[testcases]]
 name= "quickstart"
-instances = { min = 1, max = 100, default = 40 }
-
-  [testcases.params]
-  neutral_nodes = { type = "int", default = 10 }
-  word = { type = "string", default = "never" }
-  num = { type = "int", default = 2 }
-  feature = { type = "bool", default = false }
+instances = { min = 12, max = 100, default = 40 }
 
 [[testcases]]
 name = "smallbrain"
