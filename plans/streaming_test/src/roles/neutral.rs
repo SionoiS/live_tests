@@ -26,7 +26,7 @@ pub async fn neutral(
 
     // Barrier waiting for every container to initialize and subscribe.
     sync_client
-        .wait_for_barrier(INIT_STATE, args.test_instance_count)
+        .barrier(INIT_STATE, args.test_instance_count)
         .await?;
 
     //Wait for the streamer node peer_id & multi_addr

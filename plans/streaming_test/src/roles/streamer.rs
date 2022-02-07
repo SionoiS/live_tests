@@ -33,7 +33,7 @@ pub async fn streamer(
 
     // Barrier waiting for every container to initialize and subscribe.
     sync_client
-        .wait_for_barrier(INIT_STATE, args.test_instance_count)
+        .barrier(INIT_STATE, args.test_instance_count)
         .await?;
 
     let msg = format!(

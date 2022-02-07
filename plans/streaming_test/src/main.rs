@@ -1,8 +1,8 @@
 mod ipfs;
-mod nodes;
+mod roles;
 mod utils;
 
-use nodes::{neutral::*, streamer::*, viewer::*};
+use roles::{neutral::*, streamer::*, viewer::*};
 use utils::*;
 
 use std::path::PathBuf;
@@ -13,7 +13,12 @@ use pnet::ipnetwork::IpNetwork;
 
 use libp2p::{multiaddr::Protocol, Multiaddr};
 
-use testground::client::Client;
+use testground::{
+    client::Client,
+    network_conf::{
+        FilterAction, LinkShape, NetworkConfiguration, RoutingPolicyType, DEAFULT_DATA_NETWORK,
+    },
+};
 
 #[derive(StructOpt)]
 #[allow(dead_code)]
@@ -103,6 +108,31 @@ async fn main() -> Result<()> {
         .wait_network_initialized()
         .await
         .expect("Network initialization");
+
+    let config = NetworkConfiguration {
+        network: DEAFULT_DATA_NETWORK.to_owned(),
+        ipv4: None,
+        enable: true,
+        default: LinkShape {
+            latency: "50ms".to_owned(),
+            jitter: "5ms".to_owned(),
+            bandwidth: 2000,
+            filter: FilterAction::Accept,
+            loss: 0.1,
+            corrupt: 0.1,
+            corrupt_corr: 0.1,
+            reorder: 0.1,
+            reorder_corr: 0.1,
+            duplicate: 0.1,
+            duplicate_corr: 0.1,
+        },
+        rules: vec![],
+        callback_state: "network-shaping".to_owned(),
+        callback_target: args.test_instance_count,
+        routing_policy: RoutingPolicyType::AllowAll,
+    };
+
+    sync_client.configure_network(config).await?;
 
     let sim_id = sync_client
         .signal(INIT_STATE)

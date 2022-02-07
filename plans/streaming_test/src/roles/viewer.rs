@@ -34,7 +34,7 @@ pub async fn viewer(
 
     // Barrier waiting for every container to initialize and subscribe.
     sync_client
-        .wait_for_barrier(INIT_STATE, args.test_instance_count)
+        .barrier(INIT_STATE, args.test_instance_count)
         .await?;
 
     let mut peer_ids: Vec<PeerId> = Vec::with_capacity(args.test_instance_count as usize);
