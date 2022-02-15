@@ -1,17 +1,21 @@
+use std::sync::{
+    atomic::{AtomicI64, Ordering},
+    Arc,
+};
+
 use crate::{
     ipfs::{self, IpfsClient},
     utils::{custom_instance_params, data_network_ip, StreamerMessage},
-    Result, BOOTSTRAP_STATE, GOSSIPSUB_INTERVAL_MS, GOSSIPSUB_TOPIC, INIT_STATE, NET_STATE,
-    REDIS_TOPIC, STOP_STATE,
+    Result, BOOTSTRAP_STATE, GOSSIPSUB_TOPIC, INIT_STATE, NET_STATE, REDIS_TOPIC, STOP_STATE,
 };
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 
 use cid::Cid;
 use futures_util::stream::StreamExt;
 
 use influxdb::WriteQuery;
-use tokio::{task::JoinHandle, time};
+use tokio::time;
 
 use libp2p::{gossipsub::GossipsubMessage, multiaddr::Protocol, Multiaddr, PeerId};
 
@@ -47,9 +51,9 @@ pub async fn viewer(sim_id: usize, testground: Client, runenv: RunParameters) ->
         ipv6: None,
         enable: true,
         default: LinkShape {
-            latency: 50_000_000,   // nanoseconds
-            jitter: 1_000_000,     // nanoseconds
-            bandwidth: 10_000_000, // bits per seconds
+            latency: 50_000_000,                                  // nanoseconds
+            jitter: 1_000_000,                                    // nanoseconds
+            bandwidth: test_case_params.network_bandwidth as u64, // bits per seconds
             filter: FilterAction::Accept,
             loss: 0.0,
             corrupt: 0.0,
@@ -87,8 +91,6 @@ pub async fn viewer(sim_id: usize, testground: Client, runenv: RunParameters) ->
     // Send PeerId & MultiAddress to all other nodes.
     testground.publish(REDIS_TOPIC, msg).await?;
 
-    //let neutral_nodes = (runenv.test_instance_count / 4) - 1;
-
     let mut peer_ids: Vec<PeerId> = Vec::with_capacity(runenv.test_instance_count as usize);
     let mut addresses: Vec<Multiaddr> = Vec::with_capacity(runenv.test_instance_count as usize);
 
@@ -124,7 +126,6 @@ pub async fn viewer(sim_id: usize, testground: Client, runenv: RunParameters) ->
         .barrier(NET_STATE, runenv.test_instance_count)
         .await?;
 
-    // Connect to a random peer
     //let mut rng = Xoshiro256StarStar::seed_from_u64(sim_id);
 
     for (_peer, addr) in peer_ids.into_iter().zip(addresses.into_iter()) {
@@ -154,7 +155,7 @@ pub async fn viewer(sim_id: usize, testground: Client, runenv: RunParameters) ->
 
     let mut stream = ipfs.subscribe(GOSSIPSUB_TOPIC).await?;
 
-    let mut last_receive: Option<DateTime<Utc>> = None;
+    let last_receive = Arc::new(AtomicI64::new(0));
 
     loop {
         tokio::select! {
@@ -162,8 +163,12 @@ pub async fn viewer(sim_id: usize, testground: Client, runenv: RunParameters) ->
 
             _ = &mut sleep => break,
 
-            Some(msg) = stream.next() => on_gossipsub_message(msg, &mut last_receive, local_peer_id, &testground, &ipfs).await,
+            Some(msg) = stream.next() => on_gossipsub_message(msg, last_receive.clone(), local_peer_id, testground.clone(), ipfs.clone(), test_case_params.segment_length as i64).await,
         }
+    }
+
+    if let Err(e) = testground.record_success().await {
+        eprintln!("Record Success Error: {:?}", e);
     }
 
     // Wait for all node to stop.
@@ -176,10 +181,11 @@ pub async fn viewer(sim_id: usize, testground: Client, runenv: RunParameters) ->
 
 async fn on_gossipsub_message(
     msg: GossipsubMessage,
-    last_receive: &mut Option<DateTime<Utc>>,
+    last_receive: Arc<AtomicI64>,
     local_peer_id: PeerId,
-    testground: &Client,
-    ipfs: &IpfsClient,
+    testground: Client,
+    ipfs: IpfsClient,
+    segment_length: i64,
 ) {
     let receive_time = Utc::now();
 
@@ -191,21 +197,16 @@ async fn on_gossipsub_message(
         cids,
     } = msg;
 
-    let latency = receive_time.timestamp_millis() - timestamp;
-    let jitter = if let Some(last_receive) = last_receive {
-        (receive_time.timestamp_millis() - last_receive.timestamp_millis())
-            - GOSSIPSUB_INTERVAL_MS as i64
-    } else {
-        0
-    };
+    let last_receive = last_receive.swap(receive_time.timestamp_millis(), Ordering::Relaxed);
 
-    *last_receive = Some(receive_time);
+    let latency = receive_time.timestamp_millis() - timestamp as i64;
+    let jitter = (receive_time.timestamp_millis() - last_receive) - (segment_length * 1000);
 
     let query = WriteQuery::new(receive_time.into(), "gossipsub")
         .add_field("latency", latency)
         .add_field("jitter", jitter)
         .add_tag("peer", local_peer_id.to_base58())
-        .add_tag("segment_number", count);
+        .add_tag("segment_number", count as u64);
 
     if let Err(e) = testground.record_metric(query).await {
         eprintln!("Metric Error: {:?}", e);
@@ -215,7 +216,14 @@ async fn on_gossipsub_message(
         let ipfs = ipfs.clone();
         let testground = testground.clone();
 
-        wait_for_blocks(cids, ipfs, timestamp, local_peer_id, count, testground)
+        wait_for_blocks(
+            cids,
+            ipfs,
+            timestamp as i64,
+            local_peer_id,
+            count as u64,
+            testground,
+        )
     });
 }
 
@@ -227,29 +235,23 @@ async fn wait_for_blocks(
     count: u64,
     testground: Client,
 ) {
-    let handles: Vec<JoinHandle<Cid>> = cids
+    let handles: Vec<_> = cids
         .into_iter()
         .map(|cid| {
             tokio::spawn({
                 let ipfs = ipfs.clone();
 
-                async move {
-                    let block = ipfs.get_block(cid).await;
-
-                    let cid = *block.cid();
-
-                    cid
-                }
+                async move { ipfs.get_block(cid).await }
             })
         })
         .collect();
 
-    futures_util::future::join_all(handles).await;
+    let _results = futures_util::future::join_all(handles).await;
 
-    let receive_time = Utc::now().timestamp_millis();
-    let latency = receive_time - timestamp;
+    let receive_time = Utc::now();
+    let latency = receive_time.timestamp_millis() - timestamp;
 
-    let query = WriteQuery::new(Utc::now().into(), "viewer")
+    let query = WriteQuery::new(receive_time.into(), "viewer")
         .add_field("latency", latency)
         .add_tag("peer", local_peer_id.to_base58())
         .add_tag("segment_number", count);

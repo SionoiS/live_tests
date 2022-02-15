@@ -193,7 +193,7 @@ mod tests {
     use rand::{Rng, SeedableRng};
     use rand_xoshiro::Xoshiro256StarStar;
 
-    use crate::utils::random_std_block;
+    use crate::utils::{random_block, STANDARD_BLOCK_SIZE};
 
     fn get_random_peer_id() -> PeerId {
         let local_key = identity::Keypair::generate_ed25519();
@@ -205,7 +205,7 @@ mod tests {
     fn empty_remove() {
         let mut rng = Xoshiro256StarStar::seed_from_u64(5634653465365u64);
 
-        let block = random_std_block(&mut rng);
+        let block = random_block(&mut rng, STANDARD_BLOCK_SIZE);
         let peer = get_random_peer_id();
 
         let mut exchange = BlockExchange::default();
@@ -221,7 +221,7 @@ mod tests {
     fn block_roundtrip() {
         let mut rng = Xoshiro256StarStar::seed_from_u64(5634653465365u64);
 
-        let block_one = random_std_block(&mut rng);
+        let block_one = random_block(&mut rng, STANDARD_BLOCK_SIZE);
 
         let mut exchange = BlockExchange::default();
 
@@ -236,7 +236,7 @@ mod tests {
     fn want_roundtrip() {
         let mut rng = Xoshiro256StarStar::seed_from_u64(5634653465365u64);
 
-        let block = random_std_block(&mut rng);
+        let block = random_block(&mut rng, STANDARD_BLOCK_SIZE);
         let peer = get_random_peer_id();
         let cid = block.cid().clone();
 
@@ -256,7 +256,7 @@ mod tests {
         let mut rng = Xoshiro256StarStar::seed_from_u64(5634653465365u64);
 
         let blocks = (0..5)
-            .map(|_| random_std_block(&mut rng))
+            .map(|_| random_block(&mut rng, STANDARD_BLOCK_SIZE))
             .collect::<Vec<Block>>();
 
         let peers = (0..5)
@@ -306,7 +306,7 @@ mod tests {
         let max = 100;
 
         let blocks = (0..max)
-            .map(|_| random_std_block(&mut rng))
+            .map(|_| random_block(&mut rng, STANDARD_BLOCK_SIZE))
             .collect::<Vec<Block>>();
 
         let peers = (0..max)

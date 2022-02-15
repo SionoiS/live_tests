@@ -47,9 +47,9 @@ pub async fn streamer(sim_id: usize, testground: Client, runenv: RunParameters) 
         ipv6: None,
         enable: true,
         default: LinkShape {
-            latency: 50_000_000,   // nanoseconds
-            jitter: 1_000_000,     // nanoseconds
-            bandwidth: 10_000_000, // bits per seconds
+            latency: 50_000_000,                                  // nanoseconds
+            jitter: 1_000_000,                                    // nanoseconds
+            bandwidth: test_case_params.network_bandwidth as u64, // bits per seconds
             filter: FilterAction::Accept,
             loss: 0.0,
             corrupt: 0.0,
@@ -90,8 +90,6 @@ pub async fn streamer(sim_id: usize, testground: Client, runenv: RunParameters) 
     let mut peer_ids: Vec<PeerId> = Vec::with_capacity(runenv.test_instance_count as usize);
     let mut addresses: Vec<Multiaddr> = Vec::with_capacity(runenv.test_instance_count as usize);
 
-    //let neutral_nodes = (runenv.test_instance_count / 4) - 1;
-
     testground.signal(NET_STATE).await?;
 
     while let Some(msg) = stream.next().await {
@@ -124,7 +122,6 @@ pub async fn streamer(sim_id: usize, testground: Client, runenv: RunParameters) 
         .barrier(NET_STATE, runenv.test_instance_count)
         .await?;
 
-    // Connect to one neutral node
     let mut rng = Xoshiro256StarStar::seed_from_u64(sim_id as u64);
 
     for (_peer, addr) in peer_ids.into_iter().zip(addresses.into_iter()) {
@@ -157,8 +154,12 @@ pub async fn streamer(sim_id: usize, testground: Client, runenv: RunParameters) 
             biased;
             _ = &mut sleep => break,
 
-            _ = generate_video(&ipfs, &mut rng, &mut count, test_case_params.segment_length, test_case_params.max_size_block) => {},
+            _ = generate_video(&ipfs, &mut rng, &mut count, &test_case_params) => {},
         }
+    }
+
+    if let Err(e) = testground.record_success().await {
+        eprintln!("Record Success Error: {:?}", e);
     }
 
     // Wait for all node to stop.
@@ -172,21 +173,34 @@ pub async fn streamer(sim_id: usize, testground: Client, runenv: RunParameters) 
 async fn generate_video(
     ipfs: &IpfsClient,
     rng: &mut impl RngCore,
-    counter: &mut u64,
-    segment_length: usize,
-    max_size_block: bool,
+    counter: &mut usize,
+    test_case_params: &TestCaseParams,
 ) {
     loop {
-        // 1s of 1080p60 video would be ~3 standard blocks
-        // 1s of 720p30 would be ~1 standard block
-
         let count = *counter;
         *counter += 1;
 
-        let cids = generate_blocks(ipfs, rng, 3, max_size_block);
+        let blocks = generate_blocks(
+            rng,
+            test_case_params.video_bitrate,
+            test_case_params.segment_length,
+            test_case_params.max_size_block,
+        );
 
-        // Add 1s now because the msg will be sent 1s later.
-        let timestamp = Utc::now().timestamp_millis() + (segment_length as i64 * 1000);
+        let mut cids = Vec::with_capacity(blocks.len());
+
+        for block in blocks {
+            cids.push(*block.cid());
+
+            tokio::spawn({
+                let ipfs = ipfs.clone();
+
+                async move { ipfs.add_block(block).await }
+            });
+        }
+
+        let timestamp =
+            Utc::now().timestamp_millis() as usize + (test_case_params.segment_length * 1000);
 
         let msg = StreamerMessage {
             count,
@@ -196,7 +210,7 @@ async fn generate_video(
 
         let msg = serde_json::to_vec(&msg).expect("Message Serialization");
 
-        time::sleep(Duration::from_secs(segment_length as u64)).await;
+        time::sleep(Duration::from_secs(test_case_params.segment_length as u64)).await;
 
         if let Err(e) = ipfs.publish(GOSSIPSUB_TOPIC, msg).await {
             eprintln!("GossipSub Error: {:?}", e);

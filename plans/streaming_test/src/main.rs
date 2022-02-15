@@ -14,8 +14,6 @@ pub const NET_STATE: &str = "net";
 pub const BOOTSTRAP_STATE: &str = "bootstrapped";
 pub const STOP_STATE: &str = "stop";
 pub const GOSSIPSUB_TOPIC: &str = "live";
-pub const GOSSIPSUB_INTERVAL: u64 = 1;
-pub const GOSSIPSUB_INTERVAL_MS: u64 = GOSSIPSUB_INTERVAL * 1000;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {

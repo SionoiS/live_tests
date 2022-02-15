@@ -53,63 +53,74 @@ pub fn data_network_ip(sidecar: bool, subnet: IpNetwork) -> IpAddr {
 #[serde_as]
 #[derive(Serialize, Deserialize)]
 pub struct StreamerMessage {
-    pub count: u64,
+    pub count: usize,
 
-    pub timestamp: i64,
+    pub timestamp: usize,
 
     #[serde_as(as = "Vec<DisplayFromStr>")]
     pub cids: Vec<Cid>,
 }
 
 pub fn generate_blocks(
-    ipfs: &IpfsClient,
     rng: &mut impl RngCore,
-    blocks: usize,
+    bitrate: usize,
+    segment_length: usize,
     max_size: bool,
-) -> Vec<Cid> {
-    let mut cids = Vec::with_capacity(blocks);
+) -> Vec<Block> {
+    let total_bytes = bitrate * segment_length / 8;
 
-    for _ in 0..blocks {
-        let block = if max_size {
-            random_max_block(rng)
+    let block_size = if max_size {
+        MAX_BLOCK_SIZE
+    } else {
+        STANDARD_BLOCK_SIZE
+    };
+
+    let (mut num_blocks, remainder_bytes) = {
+        let mut div = total_bytes / block_size;
+        let rem = total_bytes % block_size;
+
+        if rem > 0 {
+            div += 1;
+        }
+
+        (div, rem)
+    };
+
+    let mut cids = Vec::with_capacity(num_blocks);
+
+    loop {
+        num_blocks -= 1;
+
+        let block_size = if num_blocks == 0 && remainder_bytes > 0 {
+            remainder_bytes
         } else {
-            random_std_block(rng)
+            block_size
         };
 
-        cids.push(*block.cid());
+        let block = random_block(rng, block_size);
 
-        tokio::spawn({
-            let ipfs = ipfs.clone();
+        cids.push(block);
 
-            async move { ipfs.add_block(block).await }
-        });
+        if num_blocks == 0 {
+            break;
+        }
     }
 
     cids
 }
 
-/// Randomly generate a block.
-///
-/// 262144 bytes is standard chunker length.
-pub fn random_std_block(rng: &mut impl RngCore) -> Block {
-    let mut data = [0u8; 262144];
-    rng.fill_bytes(&mut data);
-
-    let cid = Cid::new_v1(0x0, Code::Sha2_256.digest(&data));
-
-    Block::new(Box::new(data), cid.clone())
-}
+pub const MAX_BLOCK_SIZE: usize = 524288;
+pub const STANDARD_BLOCK_SIZE: usize = 262144;
 
 /// Randomly generate a block.
-///
-/// 524288 bytes is unofficial max length.
-pub fn random_max_block(rng: &mut impl RngCore) -> Block {
-    let mut data = [0u8; 524288];
+pub fn random_block(rng: &mut impl RngCore, block_size: usize) -> Block {
+    let mut data = vec![0; block_size];
+
     rng.fill_bytes(&mut data);
 
-    let cid = Cid::new_v1(0x0, Code::Sha2_256.digest(&data));
+    let cid = Cid::new_v1(0x00, Code::Sha2_256.digest(&data));
 
-    Block::new(Box::new(data), cid.clone())
+    Block::new(data.into_boxed_slice(), cid)
 }
 
 #[derive(PartialEq, Debug)]
@@ -124,6 +135,17 @@ pub struct TestCaseParams {
     pub segment_length: usize,
 
     pub sim_time: usize,
+
+    /// ~2000000 bps ->  480p30
+    ///
+    /// ~3000000 bps -> 720p30
+    ///
+    /// ~4500000 bps -> 720p60
+    ///
+    /// ~6000000 bps -> 1080p60
+    pub video_bitrate: usize,
+
+    pub network_bandwidth: usize,
 }
 
 pub fn custom_instance_params(params: &str) -> TestCaseParams {
@@ -153,6 +175,8 @@ pub fn custom_instance_params(params: &str) -> TestCaseParams {
     let max_size_block = table["max_size_block"].parse().expect("Boolean Parsing");
     let segment_length = table["segment_length"].parse().expect("Integer Parsing");
     let sim_time = table["sim_time"].parse().expect("Integer Parsing");
+    let video_bitrate = table["video_bitrate"].parse().expect("Integer Parsing");
+    let network_bandwidth = table["network_bandwidth"].parse().expect("Integer Parsing");
 
     TestCaseParams {
         log,
@@ -161,27 +185,51 @@ pub fn custom_instance_params(params: &str) -> TestCaseParams {
         max_size_block,
         segment_length,
         sim_time,
+        video_bitrate,
+        network_bandwidth,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use rand::SeedableRng;
+    use rand_xoshiro::{Xoshiro256StarStar, Xoshiro512StarStar};
+
     use super::*;
 
     #[test]
     fn serde_test() {
         let params =
-            "log=false|log_id=12|max_concurrent_send=2|max_size_block=false|segment_length=1|sim_time=600";
+            "log=false|log_id=12|max_concurrent_send=4|max_size_block=false|segment_length=1|sim_time=600|video_bitrate=6000000|network_bandwidth=10000000";
 
         let values = TestCaseParams {
             log: false,
             log_id: 12,
-            max_concurrent_send: 2,
+            max_concurrent_send: 4,
             max_size_block: false,
             segment_length: 1,
             sim_time: 600,
+            video_bitrate: 6_000_000,
+            network_bandwidth: 10_000_000,
         };
 
         assert_eq!(values, custom_instance_params(&params))
+    }
+
+    #[test]
+    fn block_test() {
+        let mut rng = Xoshiro256StarStar::seed_from_u64(79082340324789u64);
+
+        let bitrate = 6000000;
+        let segment_length = 4;
+        let max_size = false;
+
+        let blocks = generate_blocks(&mut rng, bitrate, segment_length, max_size);
+
+        for block in blocks.iter() {
+            println!("CID -> {}", block.cid());
+        }
+
+        assert_eq!(blocks.len(), 12);
     }
 }

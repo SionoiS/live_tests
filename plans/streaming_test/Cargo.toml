@@ -9,7 +9,7 @@ edition = "2021"
 chrono = { version = "0.4", default-features = true, features = ["clock"]}
 cid = "0.8"
 futures-util = { version = "0.3", default-features = false, features = [] }
-influxdb = {version = "0.5", default-features = false, features = [] }
+influxdb = { version = "0.5", default-features = false, features = [] }
 ipfs-bitswap = { git = "https://github.com/sionois/rust-ipfs.git", branch = "bitswap"}
 libp2p = { version = "0.42", default-features = false, features = ["websocket", "mplex", "yamux", "noise", "kad", "gossipsub", "tcp-tokio", "dns-tokio", "ping"] }
 multihash = "0.16"

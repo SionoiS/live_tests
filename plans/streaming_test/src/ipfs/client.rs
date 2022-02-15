@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Error};
 
 use cid::Cid;
 use futures_util::Stream;
@@ -47,7 +47,7 @@ pub enum Command {
 
     BlockGet {
         cid: Cid,
-        sender: oneshot::Sender<Block>,
+        sender: oneshot::Sender<Result<Block, Error>>,
     },
 
     BlockAdd {
@@ -162,7 +162,7 @@ impl IpfsClient {
         Ok(UnboundedReceiverStream::new(receiver))
     }
 
-    pub async fn get_block(&self, cid: Cid) -> Block {
+    pub async fn get_block(&self, cid: Cid) -> Result<Block, Error> {
         let (sender, receiver) = oneshot::channel();
 
         let cmd = Command::BlockGet { cid, sender };
