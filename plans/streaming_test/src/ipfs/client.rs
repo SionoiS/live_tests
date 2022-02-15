@@ -14,7 +14,7 @@ use libp2p::{
 };
 
 use tokio::sync::{mpsc, oneshot};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 #[derive(Debug)]
 pub enum Command {
@@ -42,7 +42,7 @@ pub enum Command {
     Subscribe {
         topic: String,
         sender: oneshot::Sender<Result<bool, SubscriptionError>>,
-        stream: mpsc::Sender<GossipsubMessage>,
+        stream: mpsc::UnboundedSender<GossipsubMessage>,
     },
 
     BlockGet {
@@ -53,18 +53,28 @@ pub enum Command {
     BlockAdd {
         block: Block,
     },
+
+    Dial {
+        multi_addr: Multiaddr,
+    },
 }
 
 #[derive(Clone)]
 pub struct IpfsClient {
-    cmd_tx: mpsc::Sender<Command>,
+    cmd_tx: mpsc::UnboundedSender<Command>,
 }
 
 impl IpfsClient {
-    pub fn new() -> (Self, mpsc::Receiver<Command>) {
-        let (cmd_tx, cmd_rx) = mpsc::channel(1);
+    pub fn new() -> (Self, mpsc::UnboundedReceiver<Command>) {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
         (Self { cmd_tx }, cmd_rx)
+    }
+
+    pub fn dial(&self, multi_addr: Multiaddr) {
+        let cmd = Command::Dial { multi_addr };
+
+        self.cmd_tx.send(cmd).expect("Receiver not dropped");
     }
 
     pub async fn listen_on(
@@ -75,11 +85,12 @@ impl IpfsClient {
 
         let cmd = Command::ListenOn { multi_addr, sender };
 
-        self.cmd_tx.send(cmd).await.expect("Receiver not dropped");
+        self.cmd_tx.send(cmd).expect("Receiver not dropped");
 
         receiver.await.expect("Sender not dropped")
     }
 
+    #[allow(unused)]
     pub async fn dht_add_addr(&self, peer_id: PeerId, multi_addr: Multiaddr) {
         let (sender, receiver) = oneshot::channel();
 
@@ -89,17 +100,18 @@ impl IpfsClient {
             sender,
         };
 
-        self.cmd_tx.send(cmd).await.expect("Receiver not dropped");
+        self.cmd_tx.send(cmd).expect("Receiver not dropped");
 
         receiver.await.expect("Sender not dropped")
     }
 
+    #[allow(unused)]
     pub async fn dht_bootstrap(&self) -> Result<BootstrapOk, BootstrapError> {
         let (sender, receiver) = oneshot::channel();
 
         let cmd = Command::Bootstrap { sender };
 
-        self.cmd_tx.send(cmd).await.expect("Receiver not dropped");
+        self.cmd_tx.send(cmd).expect("Receiver not dropped");
 
         receiver.await.expect("Sender not dropped")
     }
@@ -114,7 +126,7 @@ impl IpfsClient {
             sender,
         };
 
-        self.cmd_tx.send(cmd).await.expect("Receiver not dropped");
+        self.cmd_tx.send(cmd).expect("Receiver not dropped");
 
         receiver.await.expect("Sender not dropped")
     }
@@ -126,7 +138,7 @@ impl IpfsClient {
         &self,
         topic: &str,
     ) -> Result<impl Stream<Item = GossipsubMessage>, SubscriptionError> {
-        let (stream, mut receiver) = mpsc::channel(10);
+        let (stream, mut receiver) = mpsc::unbounded_channel();
         let (sender, err_rx) = oneshot::channel();
 
         let topic = topic.to_owned();
@@ -136,7 +148,7 @@ impl IpfsClient {
             stream,
         };
 
-        self.cmd_tx.send(cmd).await.expect("Receiver not dropped");
+        self.cmd_tx.send(cmd).expect("Receiver not dropped");
 
         match err_rx.await.expect("Sender not dropped") {
             Ok(status) => {
@@ -147,7 +159,7 @@ impl IpfsClient {
             Err(e) => return Err(e),
         }
 
-        Ok(ReceiverStream::new(receiver))
+        Ok(UnboundedReceiverStream::new(receiver))
     }
 
     pub async fn get_block(&self, cid: Cid) -> Block {
@@ -155,7 +167,7 @@ impl IpfsClient {
 
         let cmd = Command::BlockGet { cid, sender };
 
-        self.cmd_tx.send(cmd).await.expect("Receiver not dropped");
+        self.cmd_tx.send(cmd).expect("Receiver not dropped");
 
         receiver.await.expect("Sender not dropped")
     }
@@ -163,6 +175,6 @@ impl IpfsClient {
     pub async fn add_block(&self, block: Block) {
         let cmd = Command::BlockAdd { block };
 
-        self.cmd_tx.send(cmd).await.expect("Receiver not dropped");
+        self.cmd_tx.send(cmd).expect("Receiver not dropped");
     }
 }

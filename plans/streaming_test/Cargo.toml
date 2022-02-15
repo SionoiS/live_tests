@@ -6,16 +6,21 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-cid = "0.5"
+chrono = { version = "0.4", default-features = true, features = ["clock"]}
+cid = "0.8"
 futures-util = { version = "0.3", default-features = false, features = [] }
-ipfs-bitswap = { git = "https://github.com/matthiasbeyer/rust-ipfs.git", branch = "update-libp2p-bitswap"}
-libp2p = { version = "0.41", default-features = false, features = ["websocket", "mplex", "yamux", "noise", "kad", "gossipsub", "tcp-tokio", "dns-tokio"] }
-multihash = "0.11"
-pnet = { version = "0.29", default-features = false, features = [] }
+influxdb = {version = "0.5", default-features = false, features = [] }
+ipfs-bitswap = { git = "https://github.com/sionois/rust-ipfs.git", branch = "bitswap"}
+libp2p = { version = "0.42", default-features = false, features = ["websocket", "mplex", "yamux", "noise", "kad", "gossipsub", "tcp-tokio", "dns-tokio", "ping"] }
+multihash = "0.16"
+ipnetwork = { version = "0.18", default-features = false, features = [] }
+pnet_datalink = { version = "0.29", default-features = false, features = [] }
 rand = { version = "0.8.4", default-features = false, features = [] }
 rand_xoshiro = "0.6.0"
-testground = { git = "https://github.com/SionoiS/sdk-rust.git", branch = "network"}
-structopt = { version = "0.3", default-features = false, features = [] }
+serde = { version = "1", default-features = true, features = ["derive"] }
+serde_with = "1"
+serde_json = "1"
+testground = { git = "https://github.com/SionoiS/sdk-rust.git", branch = "metrics"}
 tokio = { version = "^1", default-features = false, features = ["rt-multi-thread", "sync", "time", "macros"] }
 tokio-stream = "0.1"
 zeroize = { version = "1.5.0", features = ["zeroize_derive"] }

@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 use std::collections::HashSet;
 
 use cid::Cid;
@@ -10,33 +12,51 @@ use libp2p::PeerId;
 pub struct BlockExchange {
     peers: Vec<PeerId>,
 
-    peer_indices: Vec<usize>, // peer idx mapped to cid idx
-    cid_indices: Vec<usize>,  // cid idx mapped to peer idx
+    /// peers idx mapped to cids idx.
+    peer_indices: Vec<usize>,
+    /// cids idx mapped to peers idx
+    cid_indices: Vec<usize>,
 
-    cids: Vec<Cid>, // First Cids with data then starting at index == data_store.len(), Cids without data
+    /// First Cids with data then starting at index == datums.len(), Cids without data
+    cids: Vec<Cid>,
     datums: Vec<Box<[u8]>>,
 }
 
 impl BlockExchange {
-    pub fn who_want_block(&self, cid: &Cid) -> HashSet<PeerId> {
-        let cid_idx = match self.cids.iter().position(|item| item == cid) {
-            Some(i) => i,
-            None => return HashSet::default(),
+    pub fn iter_wanted_blocks(&self) -> impl Iterator<Item = (PeerId, Block)> + '_ {
+        let closure = |(peer_index, cid_index): (&usize, &usize)| {
+            if *cid_index >= self.datums.len() {
+                //Dont have block
+                None
+            } else {
+                let peer = self.peers[*peer_index];
+                let block = Block::new(
+                    self.datums[*cid_index].clone(),
+                    self.cids[*cid_index].clone(),
+                );
+
+                Some((peer, block))
+            }
         };
 
-        self.cid_indices
+        self.peer_indices
             .iter()
-            .enumerate()
-            .filter_map(move |(i, idx)| {
-                if *idx == cid_idx {
-                    let peer_idx = self.peer_indices[i];
+            .zip(self.cid_indices.iter())
+            .filter_map(closure)
+    }
 
-                    Some(self.peers[peer_idx])
-                } else {
-                    None
-                }
-            })
-            .collect()
+    pub fn iter_who_want_block(&self, cid: Cid) -> impl Iterator<Item = PeerId> + '_ {
+        let closure = move |(i, idx): (usize, &usize)| {
+            if self.cids[*idx] == cid {
+                let peer_idx = self.peer_indices[i];
+
+                Some(self.peers[peer_idx])
+            } else {
+                None
+            }
+        };
+
+        self.cid_indices.iter().enumerate().filter_map(closure)
     }
 
     pub fn add_want(&mut self, peer_id: PeerId, cid: Cid) {
@@ -92,6 +112,7 @@ impl BlockExchange {
             None => return,
         };
 
+        //Reverse loop swap remove
         let mut i = self.peer_indices.len() - 1;
         loop {
             if peer_idx == self.peer_indices[i] && *cid == self.cids[self.cid_indices[i]] {
@@ -164,13 +185,15 @@ impl BlockExchange {
 
 #[cfg(test)]
 mod tests {
+    use std::hash::Hash;
+
     use super::*;
 
     use libp2p::identity;
     use rand::{Rng, SeedableRng};
     use rand_xoshiro::Xoshiro256StarStar;
 
-    use crate::utils::get_random_block;
+    use crate::utils::random_std_block;
 
     fn get_random_peer_id() -> PeerId {
         let local_key = identity::Keypair::generate_ed25519();
@@ -182,7 +205,7 @@ mod tests {
     fn empty_remove() {
         let mut rng = Xoshiro256StarStar::seed_from_u64(5634653465365u64);
 
-        let block = get_random_block(&mut rng);
+        let block = random_std_block(&mut rng);
         let peer = get_random_peer_id();
 
         let mut exchange = BlockExchange::default();
@@ -198,7 +221,7 @@ mod tests {
     fn block_roundtrip() {
         let mut rng = Xoshiro256StarStar::seed_from_u64(5634653465365u64);
 
-        let block_one = get_random_block(&mut rng);
+        let block_one = random_std_block(&mut rng);
 
         let mut exchange = BlockExchange::default();
 
@@ -213,7 +236,7 @@ mod tests {
     fn want_roundtrip() {
         let mut rng = Xoshiro256StarStar::seed_from_u64(5634653465365u64);
 
-        let block = get_random_block(&mut rng);
+        let block = random_std_block(&mut rng);
         let peer = get_random_peer_id();
         let cid = block.cid().clone();
 
@@ -223,7 +246,7 @@ mod tests {
 
         exchange.remove_want(&peer, &cid);
 
-        let peers = exchange.who_want_block(&cid);
+        let peers: Vec<PeerId> = exchange.iter_who_want_block(cid).collect();
 
         assert!(peers.is_empty())
     }
@@ -233,7 +256,7 @@ mod tests {
         let mut rng = Xoshiro256StarStar::seed_from_u64(5634653465365u64);
 
         let blocks = (0..5)
-            .map(|_| get_random_block(&mut rng))
+            .map(|_| random_std_block(&mut rng))
             .collect::<Vec<Block>>();
 
         let peers = (0..5)
@@ -253,19 +276,25 @@ mod tests {
             }
         }
 
-        let set = exchange.who_want_block(blocks[4].cid());
+        let set: HashSet<PeerId> = exchange
+            .iter_who_want_block(blocks[4].cid().clone())
+            .collect();
 
         assert_eq!(set, peers.clone().into_iter().collect::<HashSet<PeerId>>());
 
         exchange.remove_wants(blocks[0].cid());
 
-        let set = exchange.who_want_block(blocks[0].cid());
+        let set: HashSet<PeerId> = exchange
+            .iter_who_want_block(blocks[0].cid().clone())
+            .collect();
 
         assert!(set.is_empty());
 
         exchange.add_want(peers[0], blocks[0].cid().clone());
 
-        let set = exchange.who_want_block(blocks[0].cid());
+        let set: HashSet<PeerId> = exchange
+            .iter_who_want_block(blocks[0].cid().clone())
+            .collect();
 
         assert!(set.len() == 1)
     }
@@ -277,7 +306,7 @@ mod tests {
         let max = 100;
 
         let blocks = (0..max)
-            .map(|_| get_random_block(&mut rng))
+            .map(|_| random_std_block(&mut rng))
             .collect::<Vec<Block>>();
 
         let peers = (0..max)

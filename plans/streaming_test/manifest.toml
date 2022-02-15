@@ -24,22 +24,12 @@ enabled = false
 
 [[testcases]]
 name= "quickstart"
-instances = { min = 12, max = 100, default = 40 }
-
-[[testcases]]
-name = "smallbrain"
-instances = { min = 1, max = 200, default = 1 }
+instances = { min = 12, max = 400, default = 40 }
 
   [testcases.params]
-  word = { type = "string", default = "never" }
-  num = { type = "int", default = 2 }
-  feature = { type = "bool", default = false }
-
-[[testcases]]
-name = "bigbrain"
-instances = { min = 1, max = 200, default = 1 }
-
-    [testcases.params]
-    word = { type = "string", default = "always" }
-    num = { type = "int", default = 10000000 }
-    feature = { type = "bool", default = false }
+  log = { type = "bool", default = "false" }
+  log_id = { type = "int", default = 12 }
+  max_concurrent_send = { type = "int", default = 3 }
+  max_size_block = { type = "bool", default = "false" }
+  segment_length = { type = "int", default = 1 }
+  sim_time = { type = "int", default = 600 }

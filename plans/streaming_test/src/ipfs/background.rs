@@ -1,4 +1,7 @@
-use std::{collections::HashMap, io};
+use std::{
+    collections::{HashMap, HashSet},
+    io::{self, Error},
+};
 
 use cid::Cid;
 use ipfs_bitswap::{BitswapEvent, Block};
@@ -9,12 +12,13 @@ use libp2p::{
         error::GossipsubHandlerError, GossipsubEvent, GossipsubMessage, IdentTopic, TopicHash,
     },
     kad::{BootstrapError, BootstrapOk, KademliaEvent, QueryId, QueryResult},
+    ping::Failure,
     swarm::{ProtocolsHandlerUpgrErr, SwarmEvent},
     Multiaddr, PeerId, Swarm, TransportError,
 };
 
 use tokio::sync::{mpsc, oneshot};
-use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 
 use super::{
     block_exchange::BlockExchange,
@@ -23,23 +27,34 @@ use super::{
 };
 
 pub struct IpfsBackgroundService {
-    cmd_rx: ReceiverStream<Command>,
+    cmd_rx: UnboundedReceiverStream<Command>,
+
     swarm: Swarm<ComposedBehaviour>,
 
-    pending_subscribe: HashMap<TopicHash, mpsc::Sender<GossipsubMessage>>,
+    block_exchange: BlockExchange,
+
+    pending_subscribe: HashMap<TopicHash, mpsc::UnboundedSender<GossipsubMessage>>,
     routing_updates: HashMap<PeerId, oneshot::Sender<()>>,
     pending_bootstap: HashMap<QueryId, oneshot::Sender<Result<BootstrapOk, BootstrapError>>>,
     pending_listen:
         HashMap<ListenerId, oneshot::Sender<Result<Multiaddr, TransportError<io::Error>>>>,
-    block_exchange: BlockExchange,
+    pending_get_block: HashMap<Cid, oneshot::Sender<Block>>,
 
-    pending_block: HashMap<Cid, oneshot::Sender<Block>>,
+    pending_send_block: HashSet<(PeerId, Cid)>,
+    max_concurrent_send: usize,
+
+    log: bool,
 }
 
 impl IpfsBackgroundService {
-    pub fn new(cmd_rx: mpsc::Receiver<Command>, swarm: Swarm<ComposedBehaviour>) -> Self {
+    pub fn new(
+        cmd_rx: mpsc::UnboundedReceiver<Command>,
+        swarm: Swarm<ComposedBehaviour>,
+        log: bool,
+        max_concurrent_send: usize,
+    ) -> Self {
         Self {
-            cmd_rx: ReceiverStream::new(cmd_rx),
+            cmd_rx: UnboundedReceiverStream::new(cmd_rx),
             swarm,
 
             pending_subscribe: Default::default(),
@@ -47,11 +62,15 @@ impl IpfsBackgroundService {
             pending_bootstap: Default::default(),
             pending_listen: Default::default(),
             block_exchange: Default::default(),
-            pending_block: Default::default(),
+            pending_get_block: Default::default(),
+            pending_send_block: Default::default(),
+            max_concurrent_send,
+
+            log,
         }
     }
 
-    pub async fn run(&mut self) {
+    pub async fn run(mut self) {
         loop {
             tokio::select! {
                 event = self.swarm.next() => self.event(event).await,
@@ -106,12 +125,12 @@ impl IpfsBackgroundService {
                 multi_addr,
                 sender,
             } => {
+                self.routing_updates.insert(peer_id, sender);
+
                 self.swarm
                     .behaviour_mut()
                     .kademlia
                     .add_address(&peer_id, multi_addr);
-
-                self.routing_updates.insert(peer_id, sender);
             }
             Command::Bootstrap { sender } => {
                 let id = match self.swarm.behaviour_mut().kademlia.bootstrap() {
@@ -136,15 +155,17 @@ impl IpfsBackgroundService {
                 self.pending_listen.insert(id, sender);
             }
             Command::BlockGet { cid, sender } => {
-                self.swarm
-                    .behaviour_mut()
-                    .bitswap
-                    .want_block(cid.clone(), 0);
+                self.pending_get_block.insert(cid.clone(), sender);
 
-                self.pending_block.insert(cid, sender);
+                self.swarm.behaviour_mut().bitswap.want_block(cid, 0);
             }
             Command::BlockAdd { block } => {
                 self.block_exchange.add_block(block);
+            }
+            Command::Dial { multi_addr } => {
+                use libp2p::swarm::dial_opts::DialOpts;
+
+                let _ = self.swarm.dial(DialOpts::from(multi_addr));
             }
         }
     }
@@ -155,18 +176,22 @@ impl IpfsBackgroundService {
             SwarmEvent<
                 ComposedEvent,
                 EitherError<
-                    EitherError<std::io::Error, GossipsubHandlerError>,
-                    ProtocolsHandlerUpgrErr<std::io::Error>,
+                    EitherError<
+                        EitherError<ProtocolsHandlerUpgrErr<Error>, GossipsubHandlerError>,
+                        Error,
+                    >,
+                    Failure,
                 >,
             >,
         >,
     ) {
-        let event = event.expect("Swarm stream is infinite");
+        let event = event.expect("Infinite Swarm Stream");
 
         match event {
             SwarmEvent::Behaviour(ComposedEvent::Kademlia(event)) => self.kademlia(event).await,
             SwarmEvent::Behaviour(ComposedEvent::Gossipsub(event)) => self.gossipsub(event).await,
             SwarmEvent::Behaviour(ComposedEvent::Bitswap(event)) => self.bitswap(event).await,
+            SwarmEvent::Behaviour(ComposedEvent::Ping(_event)) => {}
             SwarmEvent::ConnectionEstablished {
                 peer_id: _,
                 endpoint: _,
@@ -233,7 +258,7 @@ impl IpfsBackgroundService {
                     None => return,
                 };
 
-                sender.send(message).await.expect("Receiver not dropped")
+                sender.send(message).expect("Receiver not dropped")
             }
             GossipsubEvent::Subscribed {
                 peer_id: _,
@@ -301,35 +326,95 @@ impl IpfsBackgroundService {
     }
 
     async fn bitswap(&mut self, event: BitswapEvent) {
-        match event {
-            BitswapEvent::ReceivedBlock(_, block) => {
-                let cid = block.cid();
+        // First come first served. Sending only couple blocks at a time.
 
-                if let Some(sender) = self.pending_block.remove(cid) {
+        match event {
+            BitswapEvent::ReceivedBlock(peer_id, block) => {
+                if self.log {
+                    println!("Received Block -> Peer: {} Cid: {}", peer_id, block.cid());
+                }
+
+                if let Some(sender) = self.pending_get_block.remove(block.cid()) {
                     sender.send(block.clone()).expect("Receiver not dropped");
                 }
 
-                let set = self.block_exchange.who_want_block(cid);
+                self.block_exchange.add_block(block.clone());
 
-                for peer in set {
-                    self.swarm
-                        .behaviour_mut()
-                        .bitswap
-                        .send_block(peer, block.clone());
+                if self.pending_send_block.len() >= self.max_concurrent_send {
+                    // if already sending too many blocks
+                    if self.log {
+                        println!("Too Many Pending Send");
+                    }
+
+                    return;
                 }
 
-                self.block_exchange.remove_wants(cid);
+                for peer in self.block_exchange.iter_who_want_block(block.cid().clone()) {
+                    if self.log {
+                        println!("Who Want Block -> Peer: {} Cid: {}", peer, block.cid());
+                    }
 
-                self.block_exchange.add_block(block);
+                    if !self.pending_send_block.insert((peer, block.cid().clone())) {
+                        //if already sending this peer this block
+                        if self.log {
+                            println!(
+                                "Already Sending Block -> Peer: {} Cid: {}",
+                                peer,
+                                block.cid()
+                            );
+                        }
+
+                        continue;
+                    }
+
+                    if self.log {
+                        println!("Sending Block -> Peer: {} Cid: {}", peer, block.cid());
+                    }
+
+                    self.swarm.behaviour_mut().bitswap.send_block(peer, block);
+
+                    break;
+                }
             }
             BitswapEvent::ReceivedWant(peer_id, cid, _priority) => {
+                self.block_exchange.add_want(peer_id, cid.clone());
+
+                if self.log {
+                    println!("Received Want -> Peer: {} Cid: {}", peer_id, cid);
+                }
+
+                if self.pending_send_block.len() >= self.max_concurrent_send {
+                    // if already sending too many blocks
+                    if self.log {
+                        println!("Too Many Pending Send");
+                    }
+
+                    return;
+                }
+
                 let block = match self.block_exchange.get_block(&cid) {
                     Some(b) => b,
                     None => {
-                        self.block_exchange.add_want(peer_id, cid);
+                        if self.log {
+                            println!("Doesn't Have Block");
+                        }
+
                         return;
                     }
                 };
+
+                if !self.pending_send_block.insert((peer_id, cid.clone())) {
+                    //if already sending this peer this block
+                    if self.log {
+                        println!("Already Sending Block -> Peer: {} Cid: {}", peer_id, cid);
+                    }
+
+                    return;
+                }
+
+                if self.log {
+                    println!("Sending Block -> Peer: {} Cid: {}", peer_id, cid);
+                }
 
                 self.swarm
                     .behaviour_mut()
@@ -338,6 +423,46 @@ impl IpfsBackgroundService {
             }
             BitswapEvent::ReceivedCancel(peer_id, cid) => {
                 self.block_exchange.remove_want(&peer_id, &cid);
+
+                if self.log {
+                    println!("Received Cancel -> Peer: {} Cid: {}", peer_id, cid);
+                }
+
+                if !self.pending_send_block.remove(&(peer_id, cid.clone())) {
+                    // if was not sending this peer this block
+                    if self.log {
+                        println!("Was Not Sending Block -> Peer: {} Cid: {}", peer_id, cid);
+                    }
+
+                    return;
+                }
+
+                for (peer, block) in self.block_exchange.iter_wanted_blocks() {
+                    if self.log {
+                        println!("Who Want Block -> Peer: {} Cid: {}", peer, block.cid());
+                    }
+
+                    if !self.pending_send_block.insert((peer, block.cid().clone())) {
+                        //if already sending this peer this block
+                        if self.log {
+                            println!(
+                                "Already Sending Block -> Peer: {} Cid: {}",
+                                peer,
+                                block.cid()
+                            );
+                        }
+
+                        continue;
+                    }
+
+                    if self.log {
+                        println!("Sending Block -> Peer: {} Cid: {}", peer, block.cid());
+                    }
+
+                    self.swarm.behaviour_mut().bitswap.send_block(peer, block);
+
+                    break;
+                }
             }
         }
     }

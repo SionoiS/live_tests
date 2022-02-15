@@ -8,8 +8,6 @@ use composition::*;
 
 pub use client::IpfsClient;
 
-use tokio::task::JoinHandle;
-
 use libp2p::{
     gossipsub::{
         subscription_filter::AllowAllSubscriptionFilter, Gossipsub, GossipsubConfig,
@@ -17,6 +15,7 @@ use libp2p::{
     },
     identity,
     kad::{store::MemoryStore, Kademlia},
+    ping::{Ping, PingConfig},
     swarm::SwarmBuilder,
     PeerId,
 };
@@ -24,12 +23,14 @@ use libp2p::{
 use ipfs_bitswap::Bitswap;
 
 /// Returns an Ipfs Client, a background service handle and the local peer id.
-pub fn compose_network() -> (IpfsClient, JoinHandle<()>, PeerId) {
+pub fn compose_network(log: bool, max_concurrent_send: usize) -> (IpfsClient, PeerId) {
     let local_key = identity::Keypair::generate_ed25519();
     let local_peer_id = PeerId::from(local_key.clone().public());
 
     let transport =
         libp2p::tokio_development_transport(local_key.clone()).expect("Tokio Transport");
+
+    let ping = Ping::new(PingConfig::new().with_keep_alive(true));
 
     let kademlia = Kademlia::new(local_peer_id, MemoryStore::new(local_peer_id));
     let gossipsub = Gossipsub::<IdentityTransform, AllowAllSubscriptionFilter>::new(
@@ -41,6 +42,7 @@ pub fn compose_network() -> (IpfsClient, JoinHandle<()>, PeerId) {
     let bitswap = Bitswap::default();
 
     let behaviour = ComposedBehaviour {
+        ping,
         kademlia,
         gossipsub,
         bitswap,
@@ -53,11 +55,9 @@ pub fn compose_network() -> (IpfsClient, JoinHandle<()>, PeerId) {
         .build();
 
     let (ipfs_client, cmd_rx) = IpfsClient::new();
-    let mut ipfs_service = IpfsBackgroundService::new(cmd_rx, swarm);
+    let ipfs_service = IpfsBackgroundService::new(cmd_rx, swarm, log, max_concurrent_send);
 
-    let handle = tokio::spawn(async move {
-        ipfs_service.run().await;
-    });
+    tokio::spawn(ipfs_service.run());
 
-    (ipfs_client, handle, local_peer_id)
+    (ipfs_client, local_peer_id)
 }
