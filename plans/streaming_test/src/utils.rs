@@ -2,26 +2,278 @@
 
 use core::num;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr},
+    time::Duration,
 };
 
-use chrono::Utc;
-use influxdb::Timestamp;
+use chrono::{TimeZone, Utc};
+use influxdb::{Timestamp, WriteQuery};
 use ipnetwork::IpNetwork;
 
 use ipfs_bitswap::Block;
 
+use libp2p::gossipsub::GossipsubMessage;
 use rand::RngCore;
 
 use cid::Cid;
 
 use multihash::{Code, MultihashDigest};
 
+use rand_xoshiro::rand_core::block;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
+use testground::client::Client;
+use tokio::{
+    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+    time,
+};
+use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 
-use crate::ipfs::IpfsClient;
+use crate::{ipfs::IpfsClient, GOSSIPSUB_TOPIC};
+
+pub struct VideoStream {
+    ipfs: IpfsClient,
+    testground: Client,
+    block_sender: UnboundedSender<(u64, u64)>,
+
+    gossips_timestamp: VecDeque<u64>,
+    gossips: VecDeque<StreamerMessage>,
+
+    timestamps: VecDeque<u64>,
+    forward_buf: VecDeque<u64>,
+    current_segment: u64,
+
+    params: TestCaseParams,
+    sim_id: u64,
+}
+
+impl VideoStream {
+    pub fn new(
+        ipfs: IpfsClient,
+        testground: Client,
+        params: TestCaseParams,
+        sim_id: u64,
+        block_sender: UnboundedSender<(u64, u64)>,
+    ) -> Self {
+        Self {
+            ipfs,
+            testground,
+            block_sender,
+
+            gossips_timestamp: Default::default(),
+            gossips: Default::default(),
+            timestamps: Default::default(),
+            forward_buf: Default::default(),
+            current_segment: 0,
+            params,
+            sim_id,
+        }
+    }
+
+    pub fn add_gossip(&mut self, gossip: GossipsubMessage) {
+        let receive_time = Utc::now().timestamp_millis();
+
+        let msg: StreamerMessage =
+            serde_json::from_slice(&gossip.data).expect("Message Deserialization");
+
+        let latency = receive_time as u64 - msg.timestamp;
+        let jitter = if let Some(last_receive) = self.gossips_timestamp.back() {
+            (receive_time - *last_receive as i64) - (self.params.segment_length * 1000) as i64
+        } else {
+            0
+        };
+
+        let query = WriteQuery::new(Timestamp::Milliseconds(msg.timestamp as u128), "gossips")
+            .add_field("latency", latency)
+            .add_field("jitter", jitter)
+            .add_tag("sim_id", self.sim_id)
+            .add_tag("segment_number", msg.count as u64);
+
+        tokio::spawn({
+            let testground = self.testground.clone();
+
+            async move {
+                if let Err(e) = testground.record_metric(query).await {
+                    eprintln!("Metric Error: {:?}", e);
+                }
+            }
+        });
+
+        self.gossips_timestamp.push_back(receive_time as u64);
+        self.gossips.push_back(msg);
+    }
+
+    pub fn add_segment(&mut self, block_count: u64, timestamp: u64) {
+        let receive_time = Utc::now().timestamp_millis();
+
+        let latency = receive_time as u64 - timestamp;
+        let jitter = if let Some(last_receive) = self.forward_buf.back() {
+            (receive_time - *last_receive as i64) - (self.params.segment_length * 1000) as i64
+        } else {
+            0
+        };
+
+        let query = WriteQuery::new(Timestamp::Milliseconds(timestamp as u128), "blocks")
+            .add_field("latency", latency)
+            .add_field("jitter", jitter)
+            .add_tag("sim_id", self.sim_id)
+            .add_tag("segment_number", block_count);
+
+        tokio::spawn({
+            let testground = self.testground.clone();
+
+            async move {
+                if let Err(e) = testground.record_metric(query).await {
+                    eprintln!("Metric Error: {:?}", e);
+                }
+            }
+        });
+
+        if self.forward_buf.back().is_none() || *self.forward_buf.back().unwrap() == block_count - 1
+        {
+            self.forward_buf.push_back(block_count);
+            self.timestamps.push_back(timestamp);
+            return;
+        }
+
+        let last_count: u64 = *self.forward_buf.back().unwrap();
+
+        if let Some(index) = self
+            .forward_buf
+            .len()
+            .checked_sub((last_count - block_count) as usize)
+        {
+            self.forward_buf.insert(index, block_count);
+            self.timestamps.insert(index, timestamp);
+        }
+
+        //Block arrived too late, discard
+    }
+
+    pub fn advance_stream(&mut self) -> WriteQuery {
+        let now_time = Utc::now();
+        let mut query = WriteQuery::new(now_time.into(), "video");
+
+        if self.forward_buf.front().is_none() {
+            query = query
+                .add_field("buffering", true)
+                .add_tag("sim_id", self.sim_id);
+
+            return query;
+        }
+
+        let timestamp = *self.timestamps.front().unwrap();
+        let new_segment = *self.forward_buf.front().unwrap();
+
+        let skip = new_segment - (self.current_segment + 1);
+
+        if skip > 0 {
+            if !self.is_buffer_full() {
+                query = query
+                    .add_field("buffering", true)
+                    .add_tag("sim_id", self.sim_id);
+
+                return query;
+            }
+
+            query = query.add_field("skip", skip);
+        } else {
+            let latency = now_time.timestamp_millis() as u64 - timestamp;
+
+            query = query.add_field("latency", latency);
+        }
+
+        query = query
+            .add_tag("sim_id", self.sim_id)
+            .add_tag("segment_number", self.current_segment);
+
+        self.current_segment = new_segment;
+
+        self.timestamps.pop_front();
+        self.forward_buf.pop_front();
+
+        query
+    }
+
+    pub fn is_buffer_full(&self) -> bool {
+        self.forward_buf.len() >= 30 / self.params.segment_length
+    }
+
+    pub async fn run(&mut self, mut block_receiver: UnboundedReceiver<(u64, u64)>) {
+        let mut stream = self
+            .ipfs
+            .subscribe(GOSSIPSUB_TOPIC)
+            .await
+            .expect("GossipSub Subcribe");
+
+        let sleep = time::sleep(std::time::Duration::from_secs(self.params.sim_time as u64));
+
+        tokio::pin!(sleep);
+
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = &mut sleep => break,
+
+                Some(msg) = stream.next() => self.add_gossip(msg),
+
+                Some((block_count, timestamp)) = block_receiver.recv() => self.add_segment(block_count, timestamp),
+
+                _ = self.play() => {}
+            }
+        }
+    }
+
+    pub async fn play(&mut self) {
+        loop {
+            time::sleep(Duration::from_secs(self.params.segment_length as u64)).await;
+
+            let query = self.advance_stream();
+
+            tokio::spawn({
+                let testground = self.testground.clone();
+
+                async move {
+                    if let Err(e) = testground.record_metric(query).await {
+                        eprintln!("Metric Error: {:?}", e);
+                    }
+                }
+            });
+
+            if self.is_buffer_full() {
+                continue;
+            }
+
+            let (msg, timestamp) =
+                match (self.gossips.pop_front(), self.gossips_timestamp.pop_front()) {
+                    (Some(msg), Some(timestamp)) => (msg, timestamp),
+                    _ => continue,
+                };
+
+            let StreamerMessage {
+                count,
+                cids,
+                timestamp,
+            } = msg;
+
+            tokio::spawn({
+                let ipfs = self.ipfs.clone();
+                let testground = self.testground.clone();
+                let sender = self.block_sender.clone();
+
+                async move {
+                    let handles: Vec<_> = cids.into_iter().map(|cid| ipfs.get_block(cid)).collect();
+
+                    let _results = futures_util::future::join_all(handles).await;
+
+                    let _ = sender.send((count, timestamp));
+                }
+            });
+        }
+    }
+}
 
 /// Get the IP address of this container on the data network
 pub fn data_network_ip(sidecar: bool, subnet: IpNetwork) -> IpAddr {
@@ -53,9 +305,9 @@ pub fn data_network_ip(sidecar: bool, subnet: IpNetwork) -> IpAddr {
 #[serde_as]
 #[derive(Serialize, Deserialize)]
 pub struct StreamerMessage {
-    pub count: usize,
+    pub count: u64,
 
-    pub timestamp: usize,
+    pub timestamp: u64,
 
     #[serde_as(as = "Vec<DisplayFromStr>")]
     pub cids: Vec<Cid>,

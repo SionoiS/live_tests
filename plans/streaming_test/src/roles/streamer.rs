@@ -37,7 +37,8 @@ pub async fn streamer(sim_id: usize, testground: Client, runenv: RunParameters) 
     let test_case_params = custom_instance_params(&runenv.test_instance_params);
     let log = test_case_params.log && sim_id == test_case_params.log_id;
 
-    let (ipfs, local_peer_id) = ipfs::compose_network(log, test_case_params.max_concurrent_send);
+    let (ipfs, local_peer_id) =
+        ipfs::compose_network(log, 2 * test_case_params.max_concurrent_send);
 
     ipfs.listen_on(local_multi_addr.clone()).await?;
 
@@ -47,9 +48,9 @@ pub async fn streamer(sim_id: usize, testground: Client, runenv: RunParameters) 
         ipv6: None,
         enable: true,
         default: LinkShape {
-            latency: 50_000_000,                                  // nanoseconds
-            jitter: 1_000_000,                                    // nanoseconds
-            bandwidth: test_case_params.network_bandwidth as u64, // bits per seconds
+            latency: 50_000_000,                                      // nanoseconds
+            jitter: 1_000_000,                                        // nanoseconds
+            bandwidth: 2 * test_case_params.network_bandwidth as u64, // bits per seconds
             filter: FilterAction::Accept,
             loss: 0.0,
             corrupt: 0.0,
@@ -173,7 +174,7 @@ pub async fn streamer(sim_id: usize, testground: Client, runenv: RunParameters) 
 async fn generate_video(
     ipfs: &IpfsClient,
     rng: &mut impl RngCore,
-    counter: &mut usize,
+    counter: &mut u64,
     test_case_params: &TestCaseParams,
 ) {
     loop {
@@ -200,7 +201,7 @@ async fn generate_video(
         }
 
         let timestamp =
-            Utc::now().timestamp_millis() as usize + (test_case_params.segment_length * 1000);
+            Utc::now().timestamp_millis() as u64 + (test_case_params.segment_length * 1000) as u64;
 
         let msg = StreamerMessage {
             count,

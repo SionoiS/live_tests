@@ -29,7 +29,7 @@ instances = { min = 12, max = 400, default = 40 }
   [testcases.params]
   log = { type = "bool", default = "true" }
   log_id = { type = "int", default = 40 }
-  network_bandwidth = { type = "int", default = 10000000 }
+  network_bandwidth = { type = "int", default = 20000000 }
   max_concurrent_send = { type = "int", default = 4 }
   max_size_block = { type = "bool", default = "false" }
   segment_length = { type = "int", default = 4 }

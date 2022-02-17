@@ -1,6 +1,6 @@
 #![allow(unused)]
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use cid::Cid;
 
@@ -23,6 +23,24 @@ pub struct BlockExchange {
 }
 
 impl BlockExchange {
+    pub fn insertion_sort_wants(&mut self) {
+        let mut i = 1;
+
+        while (i < self.peer_indices.len()) {
+            let mut j = i;
+
+            while (j > 0 && self.peer_indices[j - 1] > self.peer_indices[j]) {
+                self.peer_indices.swap(j, j - 1);
+                self.cid_indices.swap(j, j - 1);
+
+                j -= 1;
+            }
+
+            i += 1;
+        }
+    }
+
+    /// Iterate the want list unordered.
     pub fn iter_wanted_blocks(&self) -> impl Iterator<Item = (PeerId, Block)> + '_ {
         let closure = |(peer_index, cid_index): (&usize, &usize)| {
             if *cid_index >= self.datums.len() {
@@ -90,8 +108,11 @@ impl BlockExchange {
         let mut i = self.cid_indices.len() - 1;
         loop {
             if self.cid_indices[i] == cid_index {
-                self.peer_indices.swap_remove(i);
-                self.cid_indices.swap_remove(i);
+                //self.peer_indices.swap_remove(i);
+                //self.cid_indices.swap_remove(i);
+                // Perserving ordering give best algo for streaming
+                self.peer_indices.remove(i);
+                self.cid_indices.remove(i);
             }
 
             if i == 0 {
@@ -116,8 +137,11 @@ impl BlockExchange {
         let mut i = self.peer_indices.len() - 1;
         loop {
             if peer_idx == self.peer_indices[i] && *cid == self.cids[self.cid_indices[i]] {
-                self.peer_indices.swap_remove(i);
-                self.cid_indices.swap_remove(i);
+                //self.peer_indices.swap_remove(i);
+                //self.cid_indices.swap_remove(i);
+                // Perserving ordering give best algo for streaming
+                self.peer_indices.remove(i);
+                self.cid_indices.remove(i);
             }
 
             if i == 0 {
@@ -303,7 +327,7 @@ mod tests {
     fn exchange_fuzz() {
         let mut rng = Xoshiro256StarStar::seed_from_u64(5634653465365u64);
 
-        let max = 100;
+        let max = 10;
 
         let blocks = (0..max)
             .map(|_| random_block(&mut rng, STANDARD_BLOCK_SIZE))
@@ -321,7 +345,7 @@ mod tests {
             for _ in 0..rand {
                 let rand_i: usize = rng.gen_range(0..max);
                 // For random blocks
-                exchange.add_want(*peer, blocks[rand_i].cid().clone());
+                exchange.add_want(*peer, *blocks[rand_i].cid());
             }
         }
 
@@ -345,7 +369,7 @@ mod tests {
             for _ in 0..rand {
                 let rand_i: usize = rng.gen_range(0..max);
                 // For random blocks
-                exchange.add_want(*peer, blocks[rand_i].cid().clone());
+                exchange.add_want(*peer, *blocks[rand_i].cid());
             }
         }
 
