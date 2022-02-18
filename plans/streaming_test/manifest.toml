@@ -24,14 +24,14 @@ enabled = false
 
 [[testcases]]
 name= "quickstart"
-instances = { min = 12, max = 400, default = 40 }
+instances = { min = 2, max = 400, default = 51 }
 
   [testcases.params]
-  log = { type = "bool", default = "true" }
-  log_id = { type = "int", default = 40 }
+  log = { type = "bool", default = "false" }
+  log_id = { type = "int", default = 51 }
   network_bandwidth = { type = "int", default = 20000000 }
-  max_concurrent_send = { type = "int", default = 4 }
-  max_size_block = { type = "bool", default = "false" }
-  segment_length = { type = "int", default = 4 }
+  max_concurrent_send = { type = "int", default = 5 }
+  max_size_block = { type = "bool", default = "true" }
+  segment_length = { type = "int", default = 1 }
   sim_time = { type = "int", default = 300 }
-  video_bitrate = { type = "int", default = 6000000 }
+  video_bitrate = { type = "int", default = 4000000 }

@@ -148,7 +148,7 @@ pub async fn streamer(sim_id: usize, testground: Client, runenv: RunParameters) 
     let sleep = time::sleep(Duration::from_secs(test_case_params.sim_time as u64));
     tokio::pin!(sleep);
 
-    let mut count = 0;
+    let mut count = 1;
 
     loop {
         tokio::select! {
