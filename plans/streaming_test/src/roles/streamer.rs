@@ -42,7 +42,7 @@ pub async fn streamer(sim_id: usize, testground: Client, runenv: RunParameters) 
 
     ipfs.listen_on(local_multi_addr.clone()).await?;
 
-    let config = NetworkConfiguration {
+    /* let config = NetworkConfiguration {
         network: DEAFULT_DATA_NETWORK.to_owned(),
         ipv4: None,
         ipv6: None,
@@ -66,7 +66,7 @@ pub async fn streamer(sim_id: usize, testground: Client, runenv: RunParameters) 
         routing_policy: RoutingPolicyType::AllowAll,
     };
 
-    testground.configure_network(config).await?;
+    testground.configure_network(config).await?; */
 
     /* println!(
         "Streamer Sim ID: {} Peer: {} Addr: {}",
@@ -148,6 +148,10 @@ pub async fn streamer(sim_id: usize, testground: Client, runenv: RunParameters) 
     let sleep = time::sleep(Duration::from_secs(test_case_params.sim_time as u64));
     tokio::pin!(sleep);
 
+    let mut interval = time::interval(std::time::Duration::from_secs(
+        test_case_params.segment_length as u64,
+    ));
+
     let mut count = 1;
 
     loop {
@@ -155,7 +159,7 @@ pub async fn streamer(sim_id: usize, testground: Client, runenv: RunParameters) 
             biased;
             _ = &mut sleep => break,
 
-            _ = generate_video(&ipfs, &mut rng, &mut count, &test_case_params) => {},
+            _ = interval.tick() => generate_video(&ipfs, &mut rng, &mut count, &test_case_params).await,
         }
     }
 
@@ -177,44 +181,39 @@ async fn generate_video(
     counter: &mut u64,
     test_case_params: &TestCaseParams,
 ) {
-    loop {
-        let count = *counter;
-        *counter += 1;
+    let count = *counter;
+    *counter += 1;
 
-        let blocks = generate_blocks(
-            rng,
-            test_case_params.video_bitrate,
-            test_case_params.segment_length,
-            test_case_params.max_size_block,
-        );
+    let blocks = generate_blocks(
+        rng,
+        test_case_params.video_bitrate,
+        test_case_params.segment_length,
+        test_case_params.max_size_block,
+    );
 
-        let mut cids = Vec::with_capacity(blocks.len());
+    let mut cids = Vec::with_capacity(blocks.len());
 
-        for block in blocks {
-            cids.push(*block.cid());
+    for block in blocks {
+        cids.push(*block.cid());
 
-            tokio::spawn({
-                let ipfs = ipfs.clone();
+        tokio::spawn({
+            let ipfs = ipfs.clone();
 
-                async move { ipfs.add_block(block).await }
-            });
-        }
+            async move { ipfs.add_block(block).await }
+        });
+    }
 
-        let timestamp =
-            Utc::now().timestamp_millis() as u64 + (test_case_params.segment_length * 1000) as u64;
+    let timestamp = Utc::now().timestamp_millis() as u64;
 
-        let msg = StreamerMessage {
-            count,
-            timestamp,
-            cids,
-        };
+    let msg = StreamerMessage {
+        count,
+        timestamp,
+        cids,
+    };
 
-        let msg = serde_json::to_vec(&msg).expect("Message Serialization");
+    let msg = serde_json::to_vec(&msg).expect("Message Serialization");
 
-        time::sleep(Duration::from_secs(test_case_params.segment_length as u64)).await;
-
-        if let Err(e) = ipfs.publish(GOSSIPSUB_TOPIC, msg).await {
-            eprintln!("GossipSub Error: {:?}", e);
-        }
+    if let Err(e) = ipfs.publish(GOSSIPSUB_TOPIC, msg).await {
+        eprintln!("GossipSub Error: {:?}", e);
     }
 }

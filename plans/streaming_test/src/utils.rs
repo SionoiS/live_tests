@@ -55,6 +55,8 @@ pub struct VideoStream {
     current_segment: u64,
     current_timestamp: u64,
     stopped: u64,
+    buffering: u64,
+    buffer_size: u64,
 }
 
 impl VideoStream {
@@ -85,6 +87,9 @@ impl VideoStream {
             current_segment: 0,
             current_timestamp: 0,
             stopped: 0,
+            buffering: 0,
+
+            buffer_size: 30,
         }
     }
 
@@ -183,13 +188,19 @@ impl VideoStream {
             .add_field("buffer", self.segments.len() as u64)
             .add_tag("sim_id", self.sim_id);
 
-        //TODO skip advance_stream when needed
-
-        // Wait if buffer is not big enough
-        if self.segments.len() <= 10 {
+        if self.buffering > 0 {
+            self.buffering -= 1;
             self.stopped += 1;
-            query = query.add_field("stop", self.stopped);
 
+            query = query.add_field("stop", self.stopped);
+            return query;
+        }
+
+        if self.segments.is_empty() {
+            self.stopped += 1;
+            self.buffering = self.buffer_size / 2;
+
+            query = query.add_field("stop", self.stopped);
             return query;
         }
 
@@ -199,9 +210,13 @@ impl VideoStream {
         let mut skipped_segments = 0;
 
         // If buffer head is too far
-        if self.segments.back().is_some() && (segment_idx < *self.segments.back().unwrap() - 20) {
+        if self.segments.back().is_some()
+            && segment_idx < (*self.segments.back().unwrap()) - self.buffer_size
+        {
             // Skip to mid buffer
-            while (segment_idx < *self.segments.back().unwrap() - 10) {
+            while (self.segments.back().is_some()
+                && segment_idx < *self.segments.back().unwrap() - (self.buffer_size / 2))
+            {
                 segment_idx = self.segments.pop_front().unwrap();
                 timestamp = self.timestamps.pop_front().unwrap();
 
@@ -238,12 +253,8 @@ impl VideoStream {
         query
     }
 
-    /* pub fn is_buffer_full(&self) -> bool {
-        self.segments.len() >= 20 / self.params.segment_length
-    } */
-
     pub fn buffer_space(&self) -> usize {
-        (20 / self.params.segment_length).saturating_sub(self.segments.len() + self.fetching.len())
+        (self.buffer_size as usize).saturating_sub(self.segments.len() + self.fetching.len())
     }
 
     pub async fn run(&mut self, mut block_receiver: UnboundedReceiver<(u64, u64)>) {
@@ -257,75 +268,66 @@ impl VideoStream {
 
         tokio::pin!(sleep);
 
+        let mut interval = time::interval(std::time::Duration::from_secs(
+            self.params.segment_length as u64,
+        ));
+
         loop {
             tokio::select! {
                 biased;
 
                 _ = &mut sleep => break,
 
-                _ = self.play() => {},
+                Some(msg) = stream.next() => self.add_gossip(msg),
 
                 Some((block_count, timestamp)) = block_receiver.recv() => self.add_segment(block_count, timestamp),
 
-                Some(msg) = stream.next() => self.add_gossip(msg),
+                _ = interval.tick() => self.play().await,
             }
         }
     }
 
     pub async fn play(&mut self) {
-        loop {
-            let query = self.advance_stream();
+        let query = self.advance_stream();
+
+        tokio::spawn({
+            let testground = self.testground.clone();
+
+            async move {
+                if let Err(e) = testground.record_metric(query).await {
+                    eprintln!("Metric Error: {:?}", e);
+                }
+            }
+        });
+
+        for _ in 0..self.buffer_space() {
+            let (msg, timestamp) =
+                match (self.gossips.pop_front(), self.gossips_timestamp.pop_front()) {
+                    (Some(msg), Some(timestamp)) => (msg, timestamp),
+                    _ => break,
+                };
+
+            let StreamerMessage {
+                count,
+                cids,
+                timestamp,
+            } = msg;
+
+            self.fetching.insert(count, timestamp);
 
             tokio::spawn({
+                let ipfs = self.ipfs.clone();
                 let testground = self.testground.clone();
+                let sender = self.block_sender.clone();
 
                 async move {
-                    if let Err(e) = testground.record_metric(query).await {
-                        eprintln!("Metric Error: {:?}", e);
-                    }
+                    let handles: Vec<_> = cids.into_iter().map(|cid| ipfs.get_block(cid)).collect();
+
+                    let _results = futures_util::future::join_all(handles).await;
+
+                    let _ = sender.send((count, timestamp));
                 }
             });
-
-            let mut space = self.buffer_space();
-
-            loop {
-                if space == 0 {
-                    break;
-                }
-
-                space -= 1;
-
-                let (msg, timestamp) =
-                    match (self.gossips.pop_front(), self.gossips_timestamp.pop_front()) {
-                        (Some(msg), Some(timestamp)) => (msg, timestamp),
-                        _ => break,
-                    };
-
-                let StreamerMessage {
-                    count,
-                    cids,
-                    timestamp,
-                } = msg;
-
-                self.fetching.insert(count, timestamp);
-
-                tokio::spawn({
-                    let ipfs = self.ipfs.clone();
-                    let testground = self.testground.clone();
-                    let sender = self.block_sender.clone();
-
-                    async move {
-                        let handles: Vec<_> =
-                            cids.into_iter().map(|cid| ipfs.get_block(cid)).collect();
-
-                        let _results = futures_util::future::join_all(handles).await;
-
-                        let _ = sender.send((count, timestamp));
-                    }
-                });
-            }
-
-            time::sleep(Duration::from_secs(self.params.segment_length as u64)).await;
         }
     }
 }
