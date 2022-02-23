@@ -108,11 +108,11 @@ impl BlockExchange {
         let mut i = self.cid_indices.len() - 1;
         loop {
             if self.cid_indices[i] == cid_index {
-                self.peer_indices.swap_remove(i);
-                self.cid_indices.swap_remove(i);
+                //self.peer_indices.swap_remove(i);
+                //self.cid_indices.swap_remove(i);
                 // Perserving ordering give best algo for streaming?
-                //self.peer_indices.remove(i);
-                //self.cid_indices.remove(i);
+                self.peer_indices.remove(i);
+                self.cid_indices.remove(i);
             }
 
             if i == 0 {
@@ -137,11 +137,11 @@ impl BlockExchange {
         let mut i = self.peer_indices.len() - 1;
         loop {
             if peer_idx == self.peer_indices[i] && *cid == self.cids[self.cid_indices[i]] {
-                self.peer_indices.swap_remove(i);
-                self.cid_indices.swap_remove(i);
+                //self.peer_indices.swap_remove(i);
+                //self.cid_indices.swap_remove(i);
                 // Perserving ordering give best algo for streaming?
-                //self.peer_indices.remove(i);
-                //self.cid_indices.remove(i);
+                self.peer_indices.remove(i);
+                self.cid_indices.remove(i);
             }
 
             if i == 0 {

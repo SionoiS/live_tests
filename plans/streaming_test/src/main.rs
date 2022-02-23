@@ -1,6 +1,7 @@
 mod ipfs;
 mod roles;
 mod utils;
+mod video_player;
 
 use roles::{streamer::*, viewer::*};
 

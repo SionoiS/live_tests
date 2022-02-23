@@ -42,15 +42,15 @@ pub async fn streamer(sim_id: usize, testground: Client, runenv: RunParameters) 
 
     ipfs.listen_on(local_multi_addr.clone()).await?;
 
-    /* let config = NetworkConfiguration {
+    let config = NetworkConfiguration {
         network: DEAFULT_DATA_NETWORK.to_owned(),
         ipv4: None,
         ipv6: None,
         enable: true,
         default: LinkShape {
-            latency: 50_000_000,                                      // nanoseconds
-            jitter: 1_000_000,                                        // nanoseconds
-            bandwidth: 2 * test_case_params.network_bandwidth as u64, // bits per seconds
+            latency: 50_000_000,                                  // nanoseconds
+            jitter: 1_000_000,                                    // nanoseconds
+            bandwidth: test_case_params.network_bandwidth as u64, // bits per seconds
             filter: FilterAction::Accept,
             loss: 0.0,
             corrupt: 0.0,
@@ -66,7 +66,7 @@ pub async fn streamer(sim_id: usize, testground: Client, runenv: RunParameters) 
         routing_policy: RoutingPolicyType::AllowAll,
     };
 
-    testground.configure_network(config).await?; */
+    testground.configure_network(config).await?;
 
     /* println!(
         "Streamer Sim ID: {} Peer: {} Addr: {}",
@@ -145,6 +145,12 @@ pub async fn streamer(sim_id: usize, testground: Client, runenv: RunParameters) 
         .signal_and_wait(BOOTSTRAP_STATE, runenv.test_instance_count)
         .await?;
 
+    if let Err(e) = ipfs.subscribe(GOSSIPSUB_TOPIC).await {
+        eprintln!("GossipSub Error: {:?}", e);
+    }
+
+    //TODO make sure everyone is connected and on topic
+
     let sleep = time::sleep(Duration::from_secs(test_case_params.sim_time as u64));
     tokio::pin!(sleep);
 
@@ -191,17 +197,17 @@ async fn generate_video(
         test_case_params.max_size_block,
     );
 
-    let mut cids = Vec::with_capacity(blocks.len());
+    let (adds, cids): (Vec<_>, Vec<_>) = blocks
+        .into_iter()
+        .map(|block| {
+            let cid = *block.cid();
+            let fut = ipfs.add_block(block);
 
-    for block in blocks {
-        cids.push(*block.cid());
+            (fut, cid)
+        })
+        .unzip();
 
-        tokio::spawn({
-            let ipfs = ipfs.clone();
-
-            async move { ipfs.add_block(block).await }
-        });
-    }
+    futures_util::future::join_all(adds).await;
 
     let timestamp = Utc::now().timestamp_millis() as u64;
 

@@ -1,6 +1,7 @@
 use crate::{
     ipfs::{self},
-    utils::{custom_instance_params, data_network_ip, VideoStream},
+    utils::{custom_instance_params, data_network_ip},
+    video_player::VideoStream,
     Result, BOOTSTRAP_STATE, INIT_STATE, NET_STATE, REDIS_TOPIC, STOP_STATE,
 };
 
@@ -35,7 +36,7 @@ pub async fn viewer(sim_id: usize, testground: Client, runenv: RunParameters) ->
 
     ipfs.listen_on(local_multi_addr.clone()).await?;
 
-    /* let config = NetworkConfiguration {
+    let config = NetworkConfiguration {
         network: DEAFULT_DATA_NETWORK.to_owned(),
         ipv4: None,
         ipv6: None,
@@ -59,7 +60,7 @@ pub async fn viewer(sim_id: usize, testground: Client, runenv: RunParameters) ->
         routing_policy: RoutingPolicyType::AllowAll,
     };
 
-    testground.configure_network(config).await?; */
+    testground.configure_network(config).await?;
 
     /* println!(
         "Viewer Sim ID: {} Peer: {} Addr: {}",
